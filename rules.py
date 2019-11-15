@@ -4,7 +4,12 @@ def rules(ctx):
     files = ['z_validate']
     c_flags = ['-fcolor-diagnostics', '-std=gnu11', '-march=native',
             '-Wall', '-Wextra', '-Werror']
-    configs = [['rel', ['-O3']], ['deb', ['-g']]]
+    configs = [
+        ['avx2/rel', ['-DAVX2', '-O3']],
+        ['avx2/deb', ['-DAVX2', '-g']],
+        ['sse4/rel', ['-DSSE4', '-O3']],
+        ['sse4/deb', ['-DSSE4', '-g']],
+    ]
 
     for [conf_path, conf_flags] in configs:
         o_files = []

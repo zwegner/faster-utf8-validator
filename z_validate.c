@@ -96,13 +96,36 @@
 // bytes, we AND them together. Only when all three have an error bit in common
 // do we fail validation.
 
-// Right now, this code is only for AVX-2
-typedef __m256i vec_t;
+#if defined(AVX2)
+
+// AVX2 definitions
+
+#   define z_validate_utf8  z_validate_utf8_avx2
+
+#   define V_LEN            (32)
+
+// Vector and vector mask types. We use #defines instead of typedefs so this
+// header can be included multiple times with different configurations
+
+#   define vec_t            __m256i
+#   define vmask_t          uint32_t
+#   define vmask2_t         uint64_t
+
+#   define v_load(x)        _mm256_loadu_si256((vec_t *)(x))
+#   define v_set1           _mm256_set1_epi8
+#   define v_movemask       _mm256_movemask_epi8
+#   define v_shift_left     _mm256_slli_epi16
+#   define v_shift_right    _mm256_srli_epi16
+#   define v_and            _mm256_and_si256
+#   define v_shuffle        _mm256_shuffle_epi8
+#   define v_testz          _mm256_testz_si256
 
 // Simple macro to make a vector lookup table for use with vpshufb. Since
 // AVX2 is two 16-byte halves, we duplicate the input values.
 
-#define LOOKUP16(...)   _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
+#   define V_LOOKUP16(...)    _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
+
+#   define v_shift_lanes_left v_shift_lanes_left_avx2
 
 // Move all the bytes in "top" to the left by one and fill in the first byte
 // with the last byte in "bottom". Since AVX2 generally works on two separate
@@ -111,26 +134,60 @@ typedef __m256i vec_t;
 // gives the final result in each half:
 //      top half:    top_L:top_H -->    top_L[15]:top_H[0:14]
 //   bottom half: bottom_H:top_L --> bottom_H[15]:top_L[0:14]
-static inline vec_t v_shift_left(vec_t top, vec_t bottom) {
+static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
     vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
     return _mm256_alignr_epi8(top, shl_16, 15);
 }
 
+#elif defined(SSE4)
+
+// SSE definitions. We require at least SSE4.1 for _mm_test_all_zeros()
+
+#   define z_validate_utf8  z_validate_utf8_sse4
+
+#   define V_LEN            (16)
+
+#   define vec_t            __m128i
+#   define vmask_t          uint16_t
+#   define vmask2_t         uint32_t
+
+#   define v_load(x)        _mm_lddqu_si128((vec_t *)(x))
+#   define v_set1           _mm_set1_epi8
+#   define v_movemask       _mm_movemask_epi8
+#   define v_shift_left     _mm_slli_epi16
+#   define v_shift_right    _mm_srli_epi16
+#   define v_and            _mm_and_si128
+#   define v_shuffle        _mm_shuffle_epi8
+#   define v_testz          _mm_test_all_zeros
+
+#   define V_LOOKUP16(...)  _mm_setr_epi8(__VA_ARGS__)
+
+#   define v_shift_lanes_left v_shift_lanes_left_sse4
+static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
+    return _mm_alignr_epi8(top, bottom, 15);
+}
+
+#else
+
+#   error "No valid configuration: must define one of AVX2 or SSE4
+
+#endif
+
 int z_validate_utf8(const char *data, int64_t len) {
     // Error lookup tables for the first, second, and third nibbles
-    vec_t error_1 = LOOKUP16(
+    vec_t error_1 = V_LOOKUP16(
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x06, 0x18
     );
-    vec_t error_2 = LOOKUP16(
+    vec_t error_2 = V_LOOKUP16(
         0x03, 0x01, 0x00, 0x00,
         0x08, 0x10, 0x10, 0x10,
         0x10, 0x10, 0x10, 0x10,
         0x10, 0x14, 0x10, 0x10
     );
-    vec_t error_3 = LOOKUP16(
+    vec_t error_3 = V_LOOKUP16(
         0x11, 0x11, 0x11, 0x11,
         0x11, 0x11, 0x11, 0x11,
         0x13, 0x1B, 0x1D, 0x1D,
@@ -138,40 +195,43 @@ int z_validate_utf8(const char *data, int64_t len) {
     );
 
     // Mask for table lookup indices
-    const vec_t mask_0F = _mm256_set1_epi8(0x0F);
+    const vec_t mask_0F = v_set1(0x0F);
 
     // Keep continuation bits from the previous iteration that carry over to
     // each input chunk vector
-    uint32_t last_cont = 0;
+    vmask_t last_cont = 0;
 
     // We need a vector of the input byte stream shifted forward one byte. Since
     // we don't want to read the memory before the data pointer (which might not
     // even be mapped), so initialize the loop by using vector instructions to
     // shift the byte stream forward.
-    vec_t next_bytes = v_shift_left(*(vec_t *)data, _mm256_set1_epi8(0));
+    vec_t shifted_bytes = v_shift_lanes_left(v_load(data), v_set1(0));
 
-    // Loop over input in 32-byte chunks
-    for (; len > 0; len -= 32, data += 32) {
-        vec_t bytes = *(vec_t *)data;
+    // Loop over input in V_LEN-byte chunks
+    for (; len > 0; len -= V_LEN, data += V_LEN) {
+        vec_t bytes = v_load(data);
 
         // Quick skip for ascii-only input
-        uint32_t high = _mm256_movemask_epi8(bytes);
-        if (!(high | last_cont))
+        vmask_t high = v_movemask(bytes);
+        if (!(high | last_cont)) {
+            // Make sure to load the shifted bytes for the next iteration
+            shifted_bytes = v_load(data + V_LEN - 1);
             continue;
+        }
 
         // Which bytes are required to be continuation bytes
-        uint64_t req = last_cont;
+        vmask2_t req = last_cont;
         // A bitmask of the actual continuation bytes in the input
-        uint32_t cont;
+        vmask_t cont;
 
         // Compute the continuation byte mask by finding bytes that start with
         // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
         // and shift it forward by 1, 2, or 3. This loop should be unrolled by
         // the compiler, and the (n == 1) branch inside eliminated.
-        uint64_t set = high;
+        vmask_t set = high;
         for (int n = 1; n <= 3; n++) {
-            vec_t bit = _mm256_slli_epi16(bytes, n);
-            set &= (uint32_t)_mm256_movemask_epi8(bit);
+            vec_t bit = v_shift_left(bytes, n);
+            set &= v_movemask(bit);
             // Mark continuation bytes: those that have the high bit set but
             // not the next one
             if (n == 1)
@@ -189,38 +249,54 @@ int z_validate_utf8(const char *data, int64_t len) {
             // of required continuation bytes (and thus before the bit that
             // will be cleared by a carry). This leader byte will not be
             // in the continuation mask, despite being required. QEDish.
-            req += set << n;
+            req += (vmask2_t)set << n;
         }
-        // Check that continuation bytes match.
-        if (cont != (uint32_t)req)
+        // Check that continuation bytes match. We must cast req from vmask2_t
+        // (which holds the carry mask in the upper half) to vmask_t, which
+        // zeroes out the upper bits
+        if (cont != (vmask_t)req)
             return 0;
-
-        // Get a vector of the input bytes shifted forward one byte
-        vec_t shifted_bytes = next_bytes;
 
         // Look up error masks for three consecutive nibbles. We need to
         // AND with 0x0F for each one, because vpshufb has the neat
         // "feature" that negative values in an index byte will result in 
         // a zero.
-        vec_t m_1 = _mm256_and_si256(_mm256_srli_epi16(shifted_bytes, 4),
-                mask_0F);
-        vec_t e_1 = _mm256_shuffle_epi8(error_1, m_1);
+        vec_t m_1 = v_and(v_shift_right(shifted_bytes, 4), mask_0F);
+        vec_t e_1 = v_shuffle(error_1, m_1);
 
-        vec_t m_2 = _mm256_and_si256(shifted_bytes, mask_0F);
-        vec_t e_2 = _mm256_shuffle_epi8(error_2, m_2);
+        vec_t m_2 = v_and(shifted_bytes, mask_0F);
+        vec_t e_2 = v_shuffle(error_2, m_2);
 
-        vec_t m_3 = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask_0F);
-        vec_t e_3 = _mm256_shuffle_epi8(error_3, m_3);
+        vec_t m_3 = v_and(v_shift_right(bytes, 4), mask_0F);
+        vec_t e_3 = v_shuffle(error_3, m_3);
 
         // Check if any bits are set in all three error masks
-        if (!_mm256_testz_si256(_mm256_and_si256(e_1, e_2), e_3))
+        if (!v_testz(v_and(e_1, e_2), e_3))
             return 0;
 
         // Save continuation bits and input bytes for the next round
-        last_cont = req >> 32;
-        next_bytes = *(vec_t *)(data + 31);
+        last_cont = req >> V_LEN;
+        shifted_bytes = v_load(data + V_LEN - 1);
     }
 
     // The input is valid if we don't have any more expected continuation bytes
     return last_cont == 0;
 }
+
+// Undefine all macros
+
+#undef z_validate_utf8
+#undef V_LEN
+#undef vec_t
+#undef vmask_t
+#undef vmask2_t
+#undef v_load
+#undef v_set1
+#undef v_movemask
+#undef v_shift_left
+#undef v_shift_right
+#undef v_and
+#undef v_shuffle
+#undef v_testz
+#undef V_LOOKUP16
+#undef v_shift_lanes_left

@@ -1,7 +1,16 @@
 -- Load the library
 local ffi = require('ffi')
-local lib = ffi.load('_out/rel/zval.so')
-ffi.cdef('bool z_validate_utf8(const char *data, ssize_t len);')
+local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
+local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
+ffi.cdef([[
+bool z_validate_utf8_avx2(const char *data, ssize_t len);
+bool z_validate_utf8_sse4(const char *data, ssize_t len);
+]])
+
+local VALIDATORS = {
+    lib_avx2.z_validate_utf8_avx2,
+    lib_sse4.z_validate_utf8_sse4
+}
 
 -- Ranges for certain kinds of bytes
 local ANY = { 0, 0xFF }
@@ -80,7 +89,7 @@ for idx, test in ipairs(TEST_CASES) do
 
     -- Loop through various frame shifts, to make sure we catch any issues due
     -- to vector alignment
-    for _, k in ipairs{1, 10, 28, 29, 20, 31, 32} do
+    for _, k in ipairs{1, 10, 28, 29, 20, 31, 32, 33} do
         local buffer = {}
         for j = 1, 64 do buffer[j] = 0 end
 
@@ -109,14 +118,16 @@ for idx, test in ipairs(TEST_CASES) do
                 end
 
                 -- Run the validator
-                local str = string.char(unpack(buffer))
-                local result = lib.z_validate_utf8(ffi.string(str, 64), 64)
-                if result ~= expected then
-                    fails = fails + 1
-                    print('failure:', idx, result, expected, astr(buffer))
-                    break
+                local str = ffi.string(string.char(unpack(buffer)), 64)
+                for _, validate in ipairs(VALIDATORS) do
+                    local result = validate(str, 64)
+                    if result ~= expected then
+                        fails = fails + 1
+                        print('failure:', idx, result, expected, astr(buffer))
+                        assert(false)
+                    end
+                    count = count + 1
                 end
-                count = count + 1
             end
         end
 
