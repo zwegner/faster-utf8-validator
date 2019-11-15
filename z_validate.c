@@ -101,6 +101,7 @@
 // AVX2 definitions
 
 #   define z_validate_utf8  z_validate_utf8_avx2
+#   define z_validate_vec   z_validate_vec_avx2
 
 #   define V_LEN            (32)
 
@@ -144,6 +145,7 @@ static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
 // SSE definitions. We require at least SSE4.1 for _mm_test_all_zeros()
 
 #   define z_validate_utf8  z_validate_utf8_sse4
+#   define z_validate_vec   z_validate_vec_sse4
 
 #   define V_LEN            (16)
 
@@ -173,21 +175,22 @@ static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
 
 #endif
 
-int z_validate_utf8(const char *data, int64_t len) {
+// Validate one vector's worth of input bytes
+inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) {
     // Error lookup tables for the first, second, and third nibbles
-    vec_t error_1 = V_LOOKUP16(
+    const vec_t error_1 = V_LOOKUP16(
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x06, 0x18
     );
-    vec_t error_2 = V_LOOKUP16(
+    const vec_t error_2 = V_LOOKUP16(
         0x03, 0x01, 0x00, 0x00,
         0x08, 0x10, 0x10, 0x10,
         0x10, 0x10, 0x10, 0x10,
         0x10, 0x14, 0x10, 0x10
     );
-    vec_t error_3 = V_LOOKUP16(
+    const vec_t error_3 = V_LOOKUP16(
         0x11, 0x11, 0x11, 0x11,
         0x11, 0x11, 0x11, 0x11,
         0x13, 0x1B, 0x1D, 0x1D,
@@ -197,86 +200,109 @@ int z_validate_utf8(const char *data, int64_t len) {
     // Mask for table lookup indices
     const vec_t mask_0F = v_set1(0x0F);
 
+    // Quick skip for ascii-only input
+    vmask_t high = v_movemask(bytes);
+    if (!(high | *last_cont))
+        return 1;
+
+    // Which bytes are required to be continuation bytes
+    vmask2_t req = *last_cont;
+    // A bitmask of the actual continuation bytes in the input
+    vmask_t cont;
+
+    // Compute the continuation byte mask by finding bytes that start with
+    // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
+    // and shift it forward by 1, 2, or 3. This loop should be unrolled by
+    // the compiler, and the (n == 1) branch inside eliminated.
+    vmask_t set = high;
+    for (int n = 1; n <= 3; n++) {
+        vec_t bit = v_shift_left(bytes, n);
+        set &= v_movemask(bit);
+        // Mark continuation bytes: those that have the high bit set but
+        // not the next one
+        if (n == 1)
+            cont = high ^ set;
+
+        // We add the shifted mask here instead of ORing it, which would
+        // be the more natural operation, so that this line can be done
+        // with one lea. While adding could give a different result due
+        // to carries, this will only happen for invalid UTF-8 sequences,
+        // and in a way that won't cause it to pass validation. Reasoning:
+        // Any bits for required continuation bytes come after the bits
+        // for their leader bytes, and are all contiguous. For a carry to
+        // happen, two of these bit sequences would have to overlap. If
+        // this is the case, there is a leader byte before the second set
+        // of required continuation bytes (and thus before the bit that
+        // will be cleared by a carry). This leader byte will not be
+        // in the continuation mask, despite being required. QEDish.
+        req += (vmask2_t)set << n;
+    }
+    // Check that continuation bytes match. We must cast req from vmask2_t
+    // (which holds the carry mask in the upper half) to vmask_t, which
+    // zeroes out the upper bits
+    if (cont != (vmask_t)req)
+        return 0;
+
+    // Look up error masks for three consecutive nibbles. We need to
+    // AND with 0x0F for each one, because vpshufb has the neat
+    // "feature" that negative values in an index byte will result in 
+    // a zero.
+    vec_t m_1 = v_and(v_shift_right(shifted_bytes, 4), mask_0F);
+    vec_t e_1 = v_shuffle(error_1, m_1);
+
+    vec_t m_2 = v_and(shifted_bytes, mask_0F);
+    vec_t e_2 = v_shuffle(error_2, m_2);
+
+    vec_t m_3 = v_and(v_shift_right(bytes, 4), mask_0F);
+    vec_t e_3 = v_shuffle(error_3, m_3);
+
+    // Check if any bits are set in all three error masks
+    if (!v_testz(v_and(e_1, e_2), e_3))
+        return 0;
+
+    // Save continuation bits and input bytes for the next round
+    *last_cont = req >> V_LEN;
+    return 1;
+}
+
+int z_validate_utf8(const char *data, size_t len) {
+    vec_t bytes, shifted_bytes;
+
     // Keep continuation bits from the previous iteration that carry over to
     // each input chunk vector
     vmask_t last_cont = 0;
 
-    // We need a vector of the input byte stream shifted forward one byte. Since
-    // we don't want to read the memory before the data pointer (which might not
-    // even be mapped), so initialize the loop by using vector instructions to
-    // shift the byte stream forward.
-    vec_t shifted_bytes = v_shift_lanes_left(v_load(data), v_set1(0));
+    size_t offset = 0;
+    // Deal with the input up until the last section of bytes
+    if (len >= V_LEN) {
+        // We need a vector of the input byte stream shifted forward one byte.
+        // Since we don't want to read the memory before the data pointer
+        // (which might not even be mapped), for the first chunk of input just
+        // use vector instructions.
+        shifted_bytes = v_shift_lanes_left(v_load(data), v_set1(0));
 
-    // Loop over input in V_LEN-byte chunks
-    for (; len > 0; len -= V_LEN, data += V_LEN) {
-        vec_t bytes = v_load(data);
-
-        // Quick skip for ascii-only input
-        vmask_t high = v_movemask(bytes);
-        if (!(high | last_cont)) {
-            // Make sure to load the shifted bytes for the next iteration
-            shifted_bytes = v_load(data + V_LEN - 1);
-            continue;
+        // Loop over input in V_LEN-byte chunks, as long as we can safely read
+        // that far into memory
+        for (; offset + V_LEN < len; offset += V_LEN) {
+            bytes = v_load(data + offset);
+            if (!z_validate_vec(bytes, shifted_bytes, &last_cont))
+                return 0;
+            shifted_bytes = v_load(data + offset + V_LEN - 1);
         }
+    }
+    // Deal with any bytes remaining. Rather than making a separate scalar path,
+    // just fill in a buffer, reading bytes only up to len, and load from that.
+    if (offset < len) {
+        char buffer[V_LEN + 1] = { 0 };
+        if (offset > 0)
+            buffer[0] = data[offset - 1];
+        for (int i = 0; i < (int)(len - offset); i++)
+            buffer[i + 1] = data[offset + i];
 
-        // Which bytes are required to be continuation bytes
-        vmask2_t req = last_cont;
-        // A bitmask of the actual continuation bytes in the input
-        vmask_t cont;
-
-        // Compute the continuation byte mask by finding bytes that start with
-        // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
-        // and shift it forward by 1, 2, or 3. This loop should be unrolled by
-        // the compiler, and the (n == 1) branch inside eliminated.
-        vmask_t set = high;
-        for (int n = 1; n <= 3; n++) {
-            vec_t bit = v_shift_left(bytes, n);
-            set &= v_movemask(bit);
-            // Mark continuation bytes: those that have the high bit set but
-            // not the next one
-            if (n == 1)
-                cont = high ^ set;
-
-            // We add the shifted mask here instead of ORing it, which would
-            // be the more natural operation, so that this line can be done
-            // with one lea. While adding could give a different result due
-            // to carries, this will only happen for invalid UTF-8 sequences,
-            // and in a way that won't cause it to pass validation. Reasoning:
-            // Any bits for required continuation bytes come after the bits
-            // for their leader bytes, and are all contiguous. For a carry to
-            // happen, two of these bit sequences would have to overlap. If
-            // this is the case, there is a leader byte before the second set
-            // of required continuation bytes (and thus before the bit that
-            // will be cleared by a carry). This leader byte will not be
-            // in the continuation mask, despite being required. QEDish.
-            req += (vmask2_t)set << n;
-        }
-        // Check that continuation bytes match. We must cast req from vmask2_t
-        // (which holds the carry mask in the upper half) to vmask_t, which
-        // zeroes out the upper bits
-        if (cont != (vmask_t)req)
+        bytes = v_load(buffer + 1);
+        shifted_bytes = v_load(buffer);
+        if (!z_validate_vec(bytes, shifted_bytes, &last_cont))
             return 0;
-
-        // Look up error masks for three consecutive nibbles. We need to
-        // AND with 0x0F for each one, because vpshufb has the neat
-        // "feature" that negative values in an index byte will result in 
-        // a zero.
-        vec_t m_1 = v_and(v_shift_right(shifted_bytes, 4), mask_0F);
-        vec_t e_1 = v_shuffle(error_1, m_1);
-
-        vec_t m_2 = v_and(shifted_bytes, mask_0F);
-        vec_t e_2 = v_shuffle(error_2, m_2);
-
-        vec_t m_3 = v_and(v_shift_right(bytes, 4), mask_0F);
-        vec_t e_3 = v_shuffle(error_3, m_3);
-
-        // Check if any bits are set in all three error masks
-        if (!v_testz(v_and(e_1, e_2), e_3))
-            return 0;
-
-        // Save continuation bits and input bytes for the next round
-        last_cont = req >> V_LEN;
-        shifted_bytes = v_load(data + V_LEN - 1);
     }
 
     // The input is valid if we don't have any more expected continuation bytes
@@ -286,6 +312,7 @@ int z_validate_utf8(const char *data, int64_t len) {
 // Undefine all macros
 
 #undef z_validate_utf8
+#undef z_validate_vec
 #undef V_LEN
 #undef vec_t
 #undef vmask_t

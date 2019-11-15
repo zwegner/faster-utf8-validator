@@ -3,8 +3,8 @@ local ffi = require('ffi')
 local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
 local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
 ffi.cdef([[
-bool z_validate_utf8_avx2(const char *data, ssize_t len);
-bool z_validate_utf8_sse4(const char *data, ssize_t len);
+bool z_validate_utf8_avx2(const char *data, size_t len);
+bool z_validate_utf8_sse4(const char *data, size_t len);
 ]])
 
 local VALIDATORS = {
@@ -82,6 +82,20 @@ function astr(array)
     return r .. '}'
 end
 
+-- A little helper function for running an input on each validator
+function test_validators(str, len, buffer, expected, count, fails)
+    for _, validate in ipairs(VALIDATORS) do
+        local result = validate(str, len)
+        if result ~= expected then
+            fails = fails + 1
+            print('failure:', result, expected, astr(buffer))
+            assert(false)
+        end
+        count = count + 1
+    end
+    return count, fails
+end
+
 local count, fails = 0, 0
 for idx, test in ipairs(TEST_CASES) do
     local expected = table.remove(test, 1)
@@ -117,22 +131,52 @@ for idx, test in ipairs(TEST_CASES) do
                     break
                 end
 
-                -- Run the validator
-                local str = ffi.string(string.char(unpack(buffer)), 64)
-                for _, validate in ipairs(VALIDATORS) do
-                    local result = validate(str, 64)
-                    if result ~= expected then
-                        fails = fails + 1
-                        print('failure:', idx, result, expected, astr(buffer))
-                        assert(false)
-                    end
-                    count = count + 1
-                end
+                -- Run the validators
+                local str = ffi.string(string.char(unpack(buffer)), #buffer)
+                count, fails = test_validators(str, #buffer, buffer, expected,
+                        count, fails)
             end
         end
 
         -- Make sure we're running tests
         assert(count > last_count)
+    end
+end
+
+-- Test that we're correctly dealing with input lengths, by feeding buffers
+-- with invalid bytes before and after the given range
+local TRAILING_TESTS = {
+    {  true, },
+    {  true, 0x40 },
+    {  true, 0xC2, 0x80 },
+    {  true, 0xE0, 0xA0, 0x80 },
+    {  true, 0xE1, 0x80, 0x80 },
+    {  true, 0xED, 0x80, 0x80 },
+    {  true, 0xED, 0x80, 0x80 },
+    {  true, 0xF4, 0x8F, 0x80, 0x80 },
+    { false, 0xC2, },
+    { false, 0xE1, 0x80 },
+    { false, 0xF4, 0x80, 0x80 },
+}
+
+for _, test in ipairs(TRAILING_TESTS) do
+    local expected = table.remove(test, 1)
+    for pre = 0, 40 do
+        for post = 0, 40 do
+            local buffer = {}
+            local len = pre + #test + post
+            -- Fill in invalid bytes everywhere
+            for j = 1, 128 do buffer[j] = 0xFF end
+            -- Fill in valid bytes in the range being tested
+            for j = 2, len+1 do buffer[j] = 0x20 end
+            -- Fill in the test sequence
+            for j = 1, #test do buffer[1+pre+j] = test[j] end
+
+            local _str = ffi.string(string.char(unpack(buffer)), #buffer)
+            local str = ffi.cast('const char *', _str) + 1
+            count, fails = test_validators(str, len, buffer, expected,
+                    count, fails)
+        end
     end
 end
 
