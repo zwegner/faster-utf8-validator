@@ -95,7 +95,8 @@
 //         1..C  8..B  E1..EC are valid with continuation bytes
 //         D     8..9  ED Ax and ED Bx correspond to surrogate pairs
 //         E..F  8..B  EE..EF are valid with continuation bytes
-//   F     0..3  8..B  F0..F3 are valid with continuation bytes
+//   F     0     9..B  F0 8x can be encoded with 3 bytes
+//         1..3  8..B  F1..F3 are valid with continuation bytes
 //         4     8     F4 8F BF BF is the maximum valid code point
 //
 // That leaves us with these invalid sequences, which would otherwise fit
@@ -106,13 +107,14 @@
 //   C     0..1  0..F  0x01
 //   E     0     8..9  0x02
 //         D     A..B  0x04
-//   F     4     9..F  0x08
-//   F     5..F  0..F  0x10
+//   F     0     0..8  0x08
+//         4     9..F  0x10
+//         5..F  0..F  0x20
 //
 // For every possible value of the first, second, and third nibbles, we keep
 // a lookup table that contains the bitwise OR of all errors that that nibble
 // value can cause. For example, the first nibble has zeroes in every entry
-// except for C, E, and F, and the third nibble lookup has the 0x11 bits in
+// except for C, E, and F, and the third nibble lookup has the 0x21 bits in
 // every entry, since those errors don't depend on the third nibble. After
 // doing a parallel lookup of the first/second/third nibble values for all
 // bytes, we AND them together. Only when all three have an error bit in common
@@ -204,19 +206,19 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x06, 0x18
+        0x01, 0x00, 0x06, 0x38
     );
     const vec_t error_2 = V_LOOKUP16(
-        0x03, 0x01, 0x00, 0x00,
-        0x08, 0x10, 0x10, 0x10,
-        0x10, 0x10, 0x10, 0x10,
-        0x10, 0x14, 0x10, 0x10
+        0x0B, 0x01, 0x00, 0x00,
+        0x10, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20,
+        0x20, 0x24, 0x20, 0x20
     );
     const vec_t error_3 = V_LOOKUP16(
-        0x11, 0x11, 0x11, 0x11,
-        0x11, 0x11, 0x11, 0x11,
-        0x13, 0x1B, 0x1D, 0x1D,
-        0x19, 0x19, 0x19, 0x19
+        0x29, 0x29, 0x29, 0x29,
+        0x29, 0x29, 0x29, 0x29,
+        0x2B, 0x33, 0x35, 0x35,
+        0x31, 0x31, 0x31, 0x31
     );
 
     // Mask for table lookup indices

@@ -48,12 +48,12 @@ local TEST_CASES = {
     { false, { 0xF1, 0xF1 }, CONT, CONT, ASCII },
     {  true, { 0xF1, 0xF1 }, CONT, CONT, CONT, ASCII },
 
-    -- No C0/C1 bytes
+    -- No C0/C1 bytes (overlong)
     { false, { 0xC0, 0xC1 }, ANY },
     { false, { 0xC0, 0xC1 }, ANY, ANY },
     { false, { 0xC0, 0xC1 }, ANY, ANY, ANY },
 
-    -- No E0 followed by 80..9F
+    -- No E0 followed by 80..9F (overlong)
     { false, { 0xE0, 0xE0 }, { 0x00, 0x9F }, CONT },
     {  true, { 0xE0, 0xE0 }, { 0xA0, 0xBF }, CONT },
 
@@ -62,6 +62,10 @@ local TEST_CASES = {
     {  true, { 0xED, 0xED }, { 0x80, 0x9F }, CONT },
     { false, { 0xED, 0xED }, { 0xA0, 0xBF }, CONT },
     {  true, { 0xEE, 0xEF }, CONT, CONT },
+
+    -- No F0 followed by 80..8F (overlong)
+    { false, { 0xF0, 0xF0 }, { 0x80, 0x8F }, CONT, CONT },
+    {  true, { 0xF0, 0xF0 }, { 0x90, 0xBF }, CONT, CONT },
 
     -- No code points above U+10FFFF
     {  true, { 0xF4, 0xF4 }, { 0x80, 0x8F }, CONT, CONT },
