@@ -138,30 +138,39 @@
 
 #   define v_load(x)        _mm256_loadu_si256((vec_t *)(x))
 #   define v_set1           _mm256_set1_epi8
-#   define v_movemask       _mm256_movemask_epi8
-#   define v_shift_left     _mm256_slli_epi16
-#   define v_shift_right    _mm256_srli_epi16
 #   define v_and            _mm256_and_si256
-#   define v_shuffle        _mm256_shuffle_epi8
+
+#   define v_test_bit(input, bit)                                           \
+        _mm256_movemask_epi8(_mm256_slli_epi16((input), 7 - (bit)))
+
+// Parallel table lookup for all bytes in a vector. We need to AND with 0x0F
+// for the lookup, because vpshufb has the neat "feature" that negative values
+// in an index byte will result in a zero.
+
+#   define v_lookup(table, index, shift)                                    \
+        _mm256_shuffle_epi8((table),                                        \
+                v_and(_mm256_srli_epi16((index), (shift)), v_set1(0x0F)))
+
 #   define v_testz          _mm256_testz_si256
 
 // Simple macro to make a vector lookup table for use with vpshufb. Since
 // AVX2 is two 16-byte halves, we duplicate the input values.
 
-#   define V_LOOKUP16(...)    _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
+#   define V_TABLE_16(...)    _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
 
 #   define v_shift_lanes_left v_shift_lanes_left_avx2
 
-// Move all the bytes in "top" to the left by one and fill in the first byte
-// with the last byte in "bottom". Since AVX2 generally works on two separate
-// 16-byte vectors glued together, this needs two steps. The permute2x128 takes
-// the middle 32 bytes of the 64-byte concatenation bottom:top. The align then
-// gives the final result in each half:
-//      top half:    top_L:top_H -->    top_L[15]:top_H[0:14]
-//   bottom half: bottom_H:top_L --> bottom_H[15]:top_L[0:14]
-static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
-    vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
-    return _mm256_alignr_epi8(top, shl_16, 15);
+// Move all the bytes in "input" to the left by one and fill in the first byte
+// with zero. Since AVX2 generally works on two separate 16-byte vectors glued
+// together, this needs two steps. The permute2x128 takes the middle 32 bytes
+// of the 64-byte concatenation v_zero:input. The align then gives the final
+// result in each half:
+//      top half: input_L:input_H --> input_L[15]:input_H[0:14]
+//   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
+static inline vec_t v_shift_lanes_left(vec_t input) {
+    vec_t zero = v_set1(0);
+    vec_t shl_16 = _mm256_permute2x128_si256(input, zero, 0x03);
+    return _mm256_alignr_epi8(input, shl_16, 15);
 }
 
 #elif defined(SSE4)
@@ -179,18 +188,21 @@ static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
 
 #   define v_load(x)        _mm_lddqu_si128((vec_t *)(x))
 #   define v_set1           _mm_set1_epi8
-#   define v_movemask       _mm_movemask_epi8
-#   define v_shift_left     _mm_slli_epi16
-#   define v_shift_right    _mm_srli_epi16
 #   define v_and            _mm_and_si128
-#   define v_shuffle        _mm_shuffle_epi8
 #   define v_testz          _mm_test_all_zeros
 
-#   define V_LOOKUP16(...)  _mm_setr_epi8(__VA_ARGS__)
+#   define v_test_bit(input, bit)                                           \
+        _mm_movemask_epi8(_mm_slli_epi16((input), (uint8_t)(7 - (bit))))
+
+#   define v_lookup(table, index, shift)                                    \
+        _mm_shuffle_epi8((table),                                           \
+                v_and(_mm_srli_epi16((index), (shift)), v_set1(0x0F)))
+
+#   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
 #   define v_shift_lanes_left v_shift_lanes_left_sse4
-static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
-    return _mm_alignr_epi8(top, bottom, 15);
+static inline vec_t v_shift_lanes_left(vec_t top) {
+    return _mm_alignr_epi8(top, v_set1(0), 15);
 }
 
 #else
@@ -202,30 +214,27 @@ static inline vec_t v_shift_lanes_left(vec_t top, vec_t bottom) {
 // Validate one vector's worth of input bytes
 inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) {
     // Error lookup tables for the first, second, and third nibbles
-    const vec_t error_1 = V_LOOKUP16(
+    const vec_t error_1 = V_TABLE_16(
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x06, 0x38
     );
-    const vec_t error_2 = V_LOOKUP16(
+    const vec_t error_2 = V_TABLE_16(
         0x0B, 0x01, 0x00, 0x00,
         0x10, 0x20, 0x20, 0x20,
         0x20, 0x20, 0x20, 0x20,
         0x20, 0x24, 0x20, 0x20
     );
-    const vec_t error_3 = V_LOOKUP16(
+    const vec_t error_3 = V_TABLE_16(
         0x29, 0x29, 0x29, 0x29,
         0x29, 0x29, 0x29, 0x29,
         0x2B, 0x33, 0x35, 0x35,
         0x31, 0x31, 0x31, 0x31
     );
 
-    // Mask for table lookup indices
-    const vec_t mask_0F = v_set1(0x0F);
-
     // Quick skip for ascii-only input
-    vmask_t high = v_movemask(bytes);
+    vmask_t high = v_test_bit(bytes, 7);
     if (!(high | *last_cont))
         return 1;
 
@@ -240,8 +249,7 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
     // the compiler, and the (n == 1) branch inside eliminated.
     vmask_t set = high;
     for (int n = 1; n <= 3; n++) {
-        vec_t bit = v_shift_left(bytes, n);
-        set &= v_movemask(bit);
+        set &= v_test_bit(bytes, 7 - n);
         // Mark continuation bytes: those that have the high bit set but
         // not the next one
         if (n == 1)
@@ -267,18 +275,10 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
     if (cont != (vmask_t)req)
         return 0;
 
-    // Look up error masks for three consecutive nibbles. We need to
-    // AND with 0x0F for each one, because vpshufb has the neat
-    // "feature" that negative values in an index byte will result in 
-    // a zero.
-    vec_t m_1 = v_and(v_shift_right(shifted_bytes, 4), mask_0F);
-    vec_t e_1 = v_shuffle(error_1, m_1);
-
-    vec_t m_2 = v_and(shifted_bytes, mask_0F);
-    vec_t e_2 = v_shuffle(error_2, m_2);
-
-    vec_t m_3 = v_and(v_shift_right(bytes, 4), mask_0F);
-    vec_t e_3 = v_shuffle(error_3, m_3);
+    // Look up error masks for three consecutive nibbles.
+    vec_t e_1 = v_lookup(error_1, shifted_bytes, 4);
+    vec_t e_2 = v_lookup(error_2, shifted_bytes, 0);
+    vec_t e_3 = v_lookup(error_3, bytes, 4);
 
     // Check if any bits are set in all three error masks
     if (!v_testz(v_and(e_1, e_2), e_3))
@@ -303,7 +303,7 @@ int z_validate_utf8(const char *data, size_t len) {
         // Since we don't want to read the memory before the data pointer
         // (which might not even be mapped), for the first chunk of input just
         // use vector instructions.
-        shifted_bytes = v_shift_lanes_left(v_load(data), v_set1(0));
+        shifted_bytes = v_shift_lanes_left(v_load(data));
 
         // Loop over input in V_LEN-byte chunks, as long as we can safely read
         // that far into memory
@@ -343,11 +343,9 @@ int z_validate_utf8(const char *data, size_t len) {
 #undef vmask2_t
 #undef v_load
 #undef v_set1
-#undef v_movemask
-#undef v_shift_left
-#undef v_shift_right
 #undef v_and
-#undef v_shuffle
+#undef v_test_bit
 #undef v_testz
-#undef V_LOOKUP16
+#undef v_lookup
+#undef V_TABLE_16
 #undef v_shift_lanes_left
