@@ -233,10 +233,12 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
         0x31, 0x31, 0x31, 0x31
     );
 
-    // Quick skip for ascii-only input
+    // Quick skip for ascii-only input. If there are no bytes with the high bit
+    // set, we don't need to do any more work. We return either valid or
+    // invalid based on whether we expected any continuation bytes here.
     vmask_t high = v_test_bit(bytes, 7);
-    if (!(high | *last_cont))
-        return 1;
+    if (!high)
+        return *last_cont == 0;
 
     // Which bytes are required to be continuation bytes
     vmask2_t req = *last_cont;
