@@ -207,7 +207,7 @@ static inline vec_t v_shift_lanes_left(vec_t top) {
 
 #else
 
-#   error "No valid configuration: must define one of AVX2 or SSE4
+#   error "No valid configuration: must define one of AVX2 or SSE4"
 
 #endif
 
