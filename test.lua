@@ -1,15 +1,18 @@
 -- Load the library
 local ffi = require('ffi')
+local lib_avx512 = ffi.load('_out/avx512/rel/zval.so')
 local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
 local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
 ffi.cdef([[
+bool z_validate_utf8_avx512_vbmi(const char *data, size_t len);
 bool z_validate_utf8_avx2(const char *data, size_t len);
 bool z_validate_utf8_sse4(const char *data, size_t len);
 ]])
 
 local VALIDATORS = {
-    lib_avx2.z_validate_utf8_avx2,
-    lib_sse4.z_validate_utf8_sse4
+    ['avx512'] = lib_avx512.z_validate_utf8_avx512_vbmi,
+    ['avx2']   = lib_avx2.z_validate_utf8_avx2,
+    ['sse4']   = lib_sse4.z_validate_utf8_sse4
 }
 
 -- Ranges for certain kinds of bytes
@@ -21,6 +24,8 @@ local CONT = { 0x80, 0xBF }
 -- are 2-element tables { lo, hi }. For each byte, all byte values between the
 -- corresponding lo and hi values are tested.
 local TEST_CASES = {
+    { false, { 0xC0, 0xC1 }, CONT },
+
     -- ASCII. First byte is ' ' for keeping combinatorial explosions down
     {  true, { 0x20, 0x20 }, ASCII, ASCII, ASCII },
 
@@ -88,11 +93,11 @@ end
 
 -- A little helper function for running an input on each validator
 function test_validators(str, len, buffer, expected, count, fails)
-    for _, validate in ipairs(VALIDATORS) do
+    for name, validate in pairs(VALIDATORS) do
         local result = validate(str, len)
         if result ~= expected then
             fails = fails + 1
-            print('failure:', result, expected, astr(buffer))
+            print('failure:', name, result, expected, astr(buffer))
             assert(false)
         end
         count = count + 1
@@ -107,9 +112,9 @@ for idx, test in ipairs(TEST_CASES) do
 
     -- Loop through various frame shifts, to make sure we catch any issues due
     -- to vector alignment
-    for _, k in ipairs{1, 10, 28, 29, 20, 31, 32, 33} do
+    for _, k in ipairs{1, 10, 28, 29, 20, 31, 32, 33, 60, 61, 62, 63, 64, 65} do
         local buffer = {}
-        for j = 1, 64 do buffer[j] = 0 end
+        for j = 1, 256 do buffer[j] = 0 end
 
         local last_count = count
 
@@ -164,12 +169,12 @@ local TRAILING_TESTS = {
 
 for _, test in ipairs(TRAILING_TESTS) do
     local expected = table.remove(test, 1)
-    for pre = 0, 40 do
-        for post = 0, 40 do
+    for pre = 0, 80 do
+        for post = 0, 80 do
             local buffer = {}
             local len = pre + #test + post
             -- Fill in invalid bytes everywhere
-            for j = 1, 128 do buffer[j] = 0xFF end
+            for j = 1, 256 do buffer[j] = 0xFF end
             -- Fill in valid bytes in the range being tested
             for j = 2, len+1 do buffer[j] = 0x20 end
             -- Fill in the test sequence

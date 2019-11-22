@@ -120,6 +120,8 @@
 // bytes, we AND them together. Only when all three have an error bit in common
 // do we fail validation.
 
+#define EXPECT(x, v)        __builtin_expect((x), (v))
+
 #if defined(AVX2)
 
 // AVX2 definitions
@@ -142,6 +144,9 @@
 
 #   define v_test_bit(input, bit)                                           \
         _mm256_movemask_epi8(_mm256_slli_epi16((input), 7 - (bit)))
+
+#   define v_mask_test_bit(mask, input, bit) \
+    do { (mask) &= v_test_bit((input), (bit)); } while (0)
 
 // Parallel table lookup for all bytes in a vector. We need to AND with 0x0F
 // for the lookup, because vpshufb has the neat "feature" that negative values
@@ -173,6 +178,81 @@ static inline vec_t v_shift_lanes_left(vec_t input) {
     return _mm256_alignr_epi8(input, shl_16, 15);
 }
 
+#elif defined(AVX512_VBMI)
+
+// AVX512 definitions
+
+#   define z_validate_utf8  z_validate_utf8_avx512_vbmi
+#   define z_validate_vec   z_validate_vec_avx512_vbmi
+
+#   define V_LEN            (64)
+
+// Vector and vector mask types. We use #defines instead of typedefs so this
+// header can be included multiple times with different configurations
+
+typedef struct {
+    __mmask64 lo, hi;
+} v_avx512_mask2_t;
+
+#   define vec_t            __m512i
+#   define vmask_t          __mmask64
+#   define vmask2_t         v_avx512_mask2_t
+
+#   define v_load(x)        _mm512_loadu_si512((vec_t *)(x))
+#   define v_set1           _mm512_set1_epi8
+#   define v_and            _mm512_and_si512
+#   define v_testz          !_mm512_test_epi8_mask
+
+#   define v_test_bit(input, bit)                                           \
+        _mm512_test_epi8_mask((input), v_set1((uint32_t)1 << (bit)))
+
+#   define v_mask_test_bit(mask, input, bit) \
+    do { (mask) = _mm512_mask_test_epi8_mask((mask), (input), v_set1((uint32_t)1 << (bit))); } while (0)
+
+#if 1
+#   define v_lookup(table, index, shift)                                    \
+        _mm512_permutexvar_epi8((shift) ?                                   \
+                _mm512_srli_epi16((index), (shift)) : (index), (table))
+#else
+
+#   define v_lookup(table, index, shift)                                    \
+        _mm512_shuffle_epi8((table),                                        \
+                v_and(_mm512_srli_epi16((index), (shift)), v_set1(0x0F)))
+#endif
+
+// Same macro as for AVX2, but repeated four times
+
+#   define V_TABLE_16(...)    _mm512_setr_epi8(__VA_ARGS__, __VA_ARGS__, \
+        __VA_ARGS__, __VA_ARGS__)
+
+#   define v_shift_lanes_left v_shift_lanes_left_avx512
+
+// Hack around setr_epi8 not being available
+#   define _mm512_setr_epi8(...) \
+        (__extension__ (__m512i)(__v64qi) { __VA_ARGS__ } )
+
+// Shift all bytes left by one. We do this by using a permute with shuffle
+// indices that each point forward one byte. The first byte is filled in with
+// zero by using the maskz variant of the permute, which zeroes out bytes which
+// aren't set in the mask (which is all ones except for the first bit). This is
+// a bit annoying due to the big hardcoded lookup table, but oh well. Maybe it
+// can be done in some better way...
+static inline vec_t v_shift_lanes_left(vec_t input) {
+    vec_t shift_indices = _mm512_setr_epi8(
+         0, 0, 1, 2, 3, 4, 5, 6,
+         7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,
+        23,24,25,26,27,28,29,30,
+        31,32,33,34,35,36,37,38,
+        39,40,41,42,43,44,45,46,
+        47,48,49,50,51,52,53,54,
+        55,56,57,58,59,60,61,62
+    );
+    // All bits but the first
+    __mmask64 shift_mask = ~1ULL;
+    return _mm512_maskz_permutexvar_epi8(shift_mask, shift_indices, input);
+}
+
 #elif defined(SSE4)
 
 // SSE definitions. We require at least SSE4.1 for _mm_test_all_zeros()
@@ -194,6 +274,9 @@ static inline vec_t v_shift_lanes_left(vec_t input) {
 #   define v_test_bit(input, bit)                                           \
         _mm_movemask_epi8(_mm_slli_epi16((input), (uint8_t)(7 - (bit))))
 
+#   define v_mask_test_bit(mask, input, bit) \
+    do { (mask) &= v_test_bit((input), (bit)); } while (0)
+
 #   define v_lookup(table, index, shift)                                    \
         _mm_shuffle_epi8((table),                                           \
                 v_and(_mm_srli_epi16((index), (shift)), v_set1(0x0F)))
@@ -207,12 +290,24 @@ static inline vec_t v_shift_lanes_left(vec_t top) {
 
 #else
 
-#   error "No valid configuration: must define one of AVX2 or SSE4"
+#   error "No valid configuration: must define one of AVX512_VBMI, AVX2, or SSE4"
 
 #endif
 
+#include <stdio.h>
+
+//void print_vec(vec_t a) {
+//    char buf[V_LEN];
+//    *(vec_t *)buf = a;
+//    printf("{");
+//    for (uint32_t i = 0; i < V_LEN; i++)
+//        printf("%2x,", buf[i] & 0xff);
+//    printf("}\n");
+//}
+
 // Validate one vector's worth of input bytes
-inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) {
+inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont,
+        vmask_t *mask_error, vec_t *vec_error) {
     // Error lookup tables for the first, second, and third nibbles
     const vec_t error_1 = V_TABLE_16(
         0x00, 0x00, 0x00, 0x00,
@@ -237,11 +332,15 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
     // set, we don't need to do any more work. We return either valid or
     // invalid based on whether we expected any continuation bytes here.
     vmask_t high = v_test_bit(bytes, 7);
-    if (!high)
-        return *last_cont == 0;
+//    if (!high)
+//        return *last_cont == 0;
 
     // Which bytes are required to be continuation bytes
+#if defined(AVX512_VBMI)
+    vmask2_t req = {*last_cont, 0};
+#else
     vmask2_t req = *last_cont;
+#endif
     // A bitmask of the actual continuation bytes in the input
     vmask_t cont;
 
@@ -251,11 +350,15 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
     // the compiler, and the (n == 1) branch inside eliminated.
     vmask_t set = high;
     for (int n = 1; n <= 3; n++) {
-        set &= v_test_bit(bytes, 7 - n);
+        v_mask_test_bit(set, bytes, 7 - n);
         // Mark continuation bytes: those that have the high bit set but
         // not the next one
         if (n == 1)
+#if 0//defined(AVX512_VBMI)
+            cont = _kxor_mask64(high, set);
+#else
             cont = high ^ set;
+#endif
 
         // We add the shifted mask here instead of ORing it, which would
         // be the more natural operation, so that this line can be done
@@ -269,13 +372,30 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
         // of required continuation bytes (and thus before the bit that
         // will be cleared by a carry). This leader byte will not be
         // in the continuation mask, despite being required. QEDish.
+
+#if defined(AVX512_VBMI)
+        req.lo += set << n;
+        //req.hi = _kor_mask64(req.hi, _kshiftri_mask64(set, 64-n));
+        req.hi |= set >> (64-n);
+#else
         req += (vmask2_t)set << n;
+#endif
     }
     // Check that continuation bytes match. We must cast req from vmask2_t
     // (which holds the carry mask in the upper half) to vmask_t, which
     // zeroes out the upper bits
-    if (cont != (vmask_t)req)
-        return 0;
+//#if defined(AVX512_VBMI)
+//    if (cont != req.lo)
+//#else
+//    if (cont != (vmask_t)req)
+//#endif
+//        return 0;
+#if defined(AVX512_VBMI)
+    //*mask_error = _kor_mask64(*mask_error, _kxor_mask64(cont, req.lo));
+    *mask_error |= (cont ^ req.lo);
+#else
+    *mask_error |= (cont ^ (vmask_t)req);
+#endif
 
     // Look up error masks for three consecutive nibbles.
     vec_t e_1 = v_lookup(error_1, shifted_bytes, 4);
@@ -283,11 +403,16 @@ inline int z_validate_vec(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) 
     vec_t e_3 = v_lookup(error_3, bytes, 4);
 
     // Check if any bits are set in all three error masks
-    if (!v_testz(v_and(e_1, e_2), e_3))
-        return 0;
+//    if (!v_testz(v_and(e_1, e_2), e_3))
+//        return 0;
+    *vec_error |= v_and(v_and(e_1, e_2), e_3);
 
     // Save continuation bits and input bytes for the next round
+#if defined(AVX512_VBMI)
+    *last_cont = req.hi;
+#else
     *last_cont = req >> V_LEN;
+#endif
     return 1;
 }
 
@@ -298,6 +423,9 @@ int z_validate_utf8(const char *data, size_t len) {
     // each input chunk vector
     vmask_t last_cont = 0;
 
+    vmask_t mask_error = 0;
+    vec_t vec_error = v_set1(0);
+
     size_t offset = 0;
     // Deal with the input up until the last section of bytes
     if (len >= V_LEN) {
@@ -307,11 +435,47 @@ int z_validate_utf8(const char *data, size_t len) {
         // use vector instructions.
         shifted_bytes = v_shift_lanes_left(v_load(data));
 
+#define CHUNK_LEN       (4)
+#define CHUNK_SIZE      (CHUNK_LEN * V_LEN)
+
+        for (; offset + CHUNK_SIZE < len; offset += CHUNK_SIZE) {
+            vec_t byte_vecs[CHUNK_LEN];
+            vec_t sh_byte_vecs[CHUNK_LEN];
+            for (uint32_t i = 0; i < CHUNK_LEN; i++) {
+                const char *d = data + offset + i * V_LEN;
+                byte_vecs[i] = v_load(d);
+                sh_byte_vecs[i] = shifted_bytes;
+                shifted_bytes = v_load(d + V_LEN - 1);
+            }
+
+            // Compute ASCII check for all vectors
+            vmask_t all_ascii = 0;
+            for (uint32_t i = 0; i < CHUNK_LEN; i++)
+                all_ascii |= v_test_bit(byte_vecs[i], 7);
+
+            if (EXPECT(!all_ascii, 0)) {
+                if (last_cont != 0)
+                    return 0;
+                else
+                    continue;
+            }
+
+            // Run other validations
+            for (uint32_t i = 0; i < CHUNK_LEN; i++)
+                z_validate_vec(byte_vecs[i], sh_byte_vecs[i], &last_cont,
+                        &mask_error, &vec_error);
+            if (EXPECT(mask_error, 0) || EXPECT(!v_testz(vec_error, vec_error), 0))
+                return 0;
+        }
+
         // Loop over input in V_LEN-byte chunks, as long as we can safely read
         // that far into memory
         for (; offset + V_LEN < len; offset += V_LEN) {
             bytes = v_load(data + offset);
-            if (!z_validate_vec(bytes, shifted_bytes, &last_cont))
+            if (!z_validate_vec(bytes, shifted_bytes, &last_cont,
+                        &mask_error, &vec_error))
+                return 0;
+            if (EXPECT(mask_error, 0) || EXPECT(!v_testz(vec_error, vec_error), 0))
                 return 0;
             shifted_bytes = v_load(data + offset + V_LEN - 1);
         }
@@ -327,7 +491,10 @@ int z_validate_utf8(const char *data, size_t len) {
 
         bytes = v_load(buffer + 1);
         shifted_bytes = v_load(buffer);
-        if (!z_validate_vec(bytes, shifted_bytes, &last_cont))
+        if (!z_validate_vec(bytes, shifted_bytes, &last_cont,
+                    &mask_error, &vec_error))
+            return 0;
+        if (mask_error || !v_testz(vec_error, vec_error))
             return 0;
     }
 
