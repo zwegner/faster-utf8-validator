@@ -1,5 +1,5 @@
 def rules(ctx):
-    cc = 'cc'
+    cc = 'gcc-8.4'
     files = ['z_validate']
     c_flags = [#'-fcolor-diagnostics',
  '-fPIC', '-std=gnu11', '-march=native', '-fdiagnostics-color=always',
@@ -10,12 +10,14 @@ def rules(ctx):
 #-Wa,-mattr=+avx512vbmi -Wa,-march=cannonlake -march=cannonlake -mavx512vbmi -mbmi2
 
     configs = [
+        ['avx512/rel', ['-DAVX512_VBMI', '-O3']],
+        ['avx512/deb', ['-DAVX512_VBMI', '-g']],
         ['avx2/rel', ['-DAVX2', '-O3']],
         ['avx2/deb', ['-DAVX2', '-g']],
         ['sse4/rel', ['-DSSE4', '-O3']],
         ['sse4/deb', ['-DSSE4', '-g']],
-        ['avx512/rel', ['-DAVX512_VBMI', '-O3']],
-        ['avx512/deb', ['-DAVX512_VBMI', '-g']],
+        ['neon/rel', ['-DNEON', '-O3']],
+        ['neon/deb', ['-DNEON', '-g']],
     ]
 
     for [conf_path, conf_flags] in configs:
@@ -35,8 +37,9 @@ def rules(ctx):
         ctx.add_rule(bin_file, o_files,
             [cc, '-shared', '-o', bin_file, *c_flags, *o_files])
 
-    # Assembly output
-    main_obj = '_out/avx512/rel/z_validate.o'
-    asm_out = '_out/zval.s'
-    ctx.add_rule(asm_out, [main_obj], ['sh', '-c',
-        'objdump -d -Mintel %s > %s' % (main_obj, asm_out)])
+        # Assembly output
+        main_obj = '_out/%s/z_validate.o' % conf_path
+        asm_out = '_out/%s/zval.s' % conf_path
+        args = '-Mintel' if 'neon' not in conf_path else ''
+        ctx.add_rule(asm_out, [main_obj], ['sh', '-c',
+            'objdump -d %s %s > %s' % (args, main_obj, asm_out)])

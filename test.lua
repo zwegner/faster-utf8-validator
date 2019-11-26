@@ -1,18 +1,21 @@
 -- Load the library
 local ffi = require('ffi')
-local lib_avx512 = ffi.load('_out/avx512/rel/zval.so')
-local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
-local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
+--local lib_avx512 = ffi.load('_out/avx512/rel/zval.so')
+--local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
+--local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
+local lib_neon = ffi.load('_out/neon/rel/zval.so')
 ffi.cdef([[
 bool z_validate_utf8_avx512_vbmi(const char *data, size_t len);
 bool z_validate_utf8_avx2(const char *data, size_t len);
 bool z_validate_utf8_sse4(const char *data, size_t len);
+bool z_validate_utf8_neon(const char *data, size_t len);
 ]])
 
 local VALIDATORS = {
-    ['avx512'] = lib_avx512.z_validate_utf8_avx512_vbmi,
-    ['avx2']   = lib_avx2.z_validate_utf8_avx2,
-    ['sse4']   = lib_sse4.z_validate_utf8_sse4
+--    ['avx512'] = lib_avx512.z_validate_utf8_avx512_vbmi,
+--    ['avx2']   = lib_avx2.z_validate_utf8_avx2,
+--    ['sse4']   = lib_sse4.z_validate_utf8_sse4,
+    ['neon']   = lib_neon.z_validate_utf8_neon,
 }
 
 -- Ranges for certain kinds of bytes
@@ -24,8 +27,6 @@ local CONT = { 0x80, 0xBF }
 -- are 2-element tables { lo, hi }. For each byte, all byte values between the
 -- corresponding lo and hi values are tested.
 local TEST_CASES = {
-    { false, { 0xC0, 0xC1 }, CONT },
-
     -- ASCII. First byte is ' ' for keeping combinatorial explosions down
     {  true, { 0x20, 0x20 }, ASCII, ASCII, ASCII },
 
@@ -46,12 +47,13 @@ local TEST_CASES = {
     { false, { 0xE1, 0xE1 }, CONT, CONT, CONT },
 
     -- 4-byte sequences
-    { false, { 0xF1, 0xF1 }, },
-    { false, { 0xF1, 0xF1 }, CONT },
-    { false, { 0xF1, 0xF1 }, CONT, CONT },
-    {  true, { 0xF1, 0xF1 }, CONT, CONT, CONT },
-    { false, { 0xF1, 0xF1 }, CONT, CONT, ASCII },
-    {  true, { 0xF1, 0xF1 }, CONT, CONT, CONT, ASCII },
+    { false, { 0xF1, 0xF3 }, },
+    { false, { 0xF1, 0xF3 }, CONT },
+    { false, { 0xF1, 0xF3 }, CONT, CONT },
+    {  true, { 0xF1, 0xF3 }, CONT, CONT, CONT },
+    { false, { 0xF1, 0xF3 }, CONT, CONT, ASCII },
+    {  true, { 0xF1, 0xF3 }, CONT, CONT, CONT, ASCII },
+    { false, { 0xF1, 0xF3 }, CONT, CONT, CONT, CONT },
 
     -- No C0/C1 bytes (overlong)
     { false, { 0xC0, 0xC1 }, ANY },
@@ -109,10 +111,11 @@ local count, fails = 0, 0
 for idx, test in ipairs(TEST_CASES) do
     local expected = table.remove(test, 1)
     local lo_1, hi_1 = unpack(table.remove(test, 1))
-
     -- Loop through various frame shifts, to make sure we catch any issues due
     -- to vector alignment
-    for _, k in ipairs{1, 10, 28, 29, 20, 31, 32, 33, 60, 61, 62, 63, 64, 65} do
+    --for _, k in ipairs{60, 61, 62, 63, 64, 65} do
+    --for _, k in ipairs{1, 10, 28, 29, 20, 31, 32, 33, 60, 61, 62, 63, 64, 65} do
+    for k = 1, 70 do
         local buffer = {}
         for j = 1, 256 do buffer[j] = 0 end
 
