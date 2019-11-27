@@ -1,8 +1,10 @@
 def rules(ctx):
     cc = 'gcc-8.4'
     files = ['z_validate']
+    gen_dir = '_out/gen'
     c_flags = [#'-fcolor-diagnostics',
  '-fPIC', '-std=gnu11', '-march=native', '-fdiagnostics-color=always',
+ '-I%s' % gen_dir,
             '-Wall', '-Wextra', '-Werror']
 
     #c_flags += ['-std=c++11']
@@ -20,6 +22,11 @@ def rules(ctx):
         ['neon/deb', ['-DNEON', '-g']],
     ]
 
+    # Generated tables
+    table_path = '%s/table.h' % gen_dir
+    ctx.add_rule(table_path, ['gen_table.py'],
+            ['python3', 'gen_table.py', table_path])
+
     for [conf_path, conf_flags] in configs:
         o_files = []
         for f in files:
@@ -29,7 +36,8 @@ def rules(ctx):
             d_file = '_out/%s/%s.d' % (conf_path, f)
             cmd = [cc, '-o', o_file, '-c', c_file, '-MD', *c_flags,
                     *conf_flags]
-            ctx.add_rule(o_file, [c_file], cmd, d_file=d_file)
+            ctx.add_rule(o_file, [c_file], cmd, d_file=d_file,
+                    order_only_deps=[table_path])
             o_files.append(o_file)
 
         # Main shared library

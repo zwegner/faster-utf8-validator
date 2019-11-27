@@ -306,6 +306,7 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t top) {
 #   define v_load(x)        vld1q_u8((uint8_t *)(x))
 #   define v_set1           vdupq_n_u8
 #   define v_and            vandq_u8
+#   define v_or             vorrq_u8
 #   define v_testz          NAME(_v_testz)
 #   define v_test_any       NAME(_v_test_any)
 
@@ -402,6 +403,8 @@ static inline vmask2_t NAME(v_reduce_shift_7)(vec_t input) {
 
 #endif
 
+#include "table.h"
+
 #if defined(NEON)
 
 static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
@@ -429,13 +432,20 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
         error = (uint16_t)(cont ^ req);
         *last_cont = (uint16_t)(req >> V_LEN);
     } else {
-        const vec_t req_table = V_TABLE_16(
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x01, 0x01, 0x01, 0x01,
-            0x02, 0x02, 0x0A, 0x2A
-        );
-        vec_t v_req = v_lookup(req_table, bytes, 4);
+        vec_t v_req;
+        if (1) {
+            const vec_t req_table = V_TABLE_16(
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+                0x01, 0x01, 0x01, 0x01,
+                0x02, 0x02, 0x0A, 0x2A
+            );
+            v_req = v_lookup(req_table, bytes, 4);
+        } else {
+            v_req = v_lookup(error_1, bytes, 4);
+            const vec_t valid_req = v_set1(0x2B);
+            v_req = v_and(v_req, valid_req);
+        }
 
         DEBUG(NAME(print_vec)(bytes);)
         DEBUG(NAME(print_vec)(v_req);)
@@ -443,7 +453,7 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
 
         DEBUG(printf("req: %lx\n", req);)
         error = ((req >> 1) ^ req) & 0x55555555;
-        DEBUG(printf("error: %x\n", *mask_error);)
+        DEBUG(printf("error: %x\n", error);)
 
         *last_cont = req >> V_LEN*2;
     }
@@ -530,25 +540,25 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
 
 // Validate one vector's worth of input bytes
 static inline vec_t NAME(z_validate_special)(vec_t bytes, vec_t shifted_bytes) {
-    // Error lookup tables for the first, second, and third nibbles
-    const vec_t error_1 = V_TABLE_16(
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x06, 0x38
-    );
-    const vec_t error_2 = V_TABLE_16(
-        0x0B, 0x01, 0x00, 0x00,
-        0x10, 0x20, 0x20, 0x20,
-        0x20, 0x20, 0x20, 0x20,
-        0x20, 0x24, 0x20, 0x20
-    );
-    const vec_t error_3 = V_TABLE_16(
-        0x29, 0x29, 0x29, 0x29,
-        0x29, 0x29, 0x29, 0x29,
-        0x2B, 0x33, 0x35, 0x35,
-        0x31, 0x31, 0x31, 0x31
-    );
+//    // Error lookup tables for the first, second, and third nibbles
+//    const vec_t error_1 = V_TABLE_16(
+//        0x00, 0x00, 0x00, 0x00,
+//        0x00, 0x00, 0x00, 0x00,
+//        0x00, 0x00, 0x00, 0x00,
+//        0x01, 0x00, 0x06, 0x38
+//    );
+//    const vec_t error_2 = V_TABLE_16(
+//        0x0B, 0x01, 0x00, 0x00,
+//        0x10, 0x20, 0x20, 0x20,
+//        0x20, 0x20, 0x20, 0x20,
+//        0x20, 0x24, 0x20, 0x20
+//    );
+//    const vec_t error_3 = V_TABLE_16(
+//        0x29, 0x29, 0x29, 0x29,
+//        0x29, 0x29, 0x29, 0x29,
+//        0x2B, 0x33, 0x35, 0x35,
+//        0x31, 0x31, 0x31, 0x31
+//    );
 
     // Look up error masks for three consecutive nibbles.
     vec_t e_1 = v_lookup(error_1, shifted_bytes, 4);
@@ -585,38 +595,42 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 //    if (!high)
 //        return *last_cont == 0;
 
-//        vmask_t mask_error = 0;
-//        vec_t vec_error = v_set1(0);
-//        for (; offset + CHUNK_SIZE < len; offset += CHUNK_SIZE) {
-//            vec_t byte_vecs[CHUNK_LEN];
-//            vec_t sh_byte_vecs[CHUNK_LEN];
-//            for (uint32_t i = 0; i < CHUNK_LEN; i++) {
-//                const char *d = data + offset + i * V_LEN;
-//                byte_vecs[i] = v_load(d);
-//                sh_byte_vecs[i] = shifted_bytes;
-//                shifted_bytes = v_load(d + V_LEN - 1);
-//            }
-//
-//            // Compute ASCII check for all vectors
-//            uint64_t all_ascii = 0;
-//            for (uint32_t i = 0; i < CHUNK_LEN; i++)
-//                //all_ascii |= v_test_bit(byte_vecs[i], 7);
-//                all_ascii |= v_test_any(v_and(byte_vecs[i], v_set1(0x80)));
-//
-//            if (UNLIKELY(!all_ascii, 0)) {
-//                if (last_cont != 0)
-//                    return 0;
-//                else
-//                    continue;
-//            }
-//
-//            // Run other validations
-//            for (uint32_t i = 0; i < CHUNK_LEN; i++)
-//                NAME(z_validate_vec)(byte_vecs[i], sh_byte_vecs[i], &last_cont,
-//                        &mask_error, &v_error);
-//            if (EXPECT(mask_error, 0) || EXPECT(!v_testz(v_error, v_error), 0))
-//                return 0;
-//        }
+        for (; offset + CHUNK_SIZE < len; offset += CHUNK_SIZE) {
+            vec_t byte_vecs[CHUNK_LEN];
+            vec_t sh_byte_vecs[CHUNK_LEN];
+            for (uint32_t i = 0; i < CHUNK_LEN; i++) {
+                const char *d = data + offset + i * V_LEN;
+                byte_vecs[i] = v_load(d);
+                sh_byte_vecs[i] = shifted_bytes;
+                shifted_bytes = v_load(d + V_LEN - 1);
+            }
+
+            // Compute ASCII check for all vectors
+            uint64_t all_ascii = 0;
+            for (uint32_t i = 0; i < CHUNK_LEN; i++)
+                //all_ascii |= v_test_bit(byte_vecs[i], 7);
+                all_ascii |= v_test_any(v_and(byte_vecs[i], v_set1(0x80)));
+
+            if (UNLIKELY(!all_ascii)) {
+                if (last_cont != 0)
+                    return 0;
+                else
+                    continue;
+            }
+
+            // Run other validations
+            vmask_t all_c_error = 0;
+            vec_t all_v_error = v_set1(0);
+            for (uint32_t i = 0; i < CHUNK_LEN; i++) {
+                vmask_t c_error = NAME(z_validate_cont)(byte_vecs[i], &last_cont);
+                vec_t v_error = NAME(z_validate_special)(byte_vecs[i], sh_byte_vecs[i]);
+                all_c_error |= c_error;
+                all_v_error = v_or(all_v_error, v_error);
+            }
+
+            if (UNLIKELY(all_c_error || v_test_any(all_v_error)))
+                return 0;
+        }
 
         // Loop over input in V_LEN-byte chunks, as long as we can safely read
         // that far into memory
