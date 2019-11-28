@@ -126,7 +126,8 @@
 // bytes, we AND them together. Only when all three have an error bit in common
 // do we fail validation.
 
-#define UNLIKELY(x)        __builtin_expect((x), (0))
+#define LIKELY(x)           __builtin_expect((x), (1))
+#define UNLIKELY(x)         __builtin_expect((x), (0))
 
 #define NAME_(name, suff) name##_##suff
 #define NAME__(name, SUFFIX)     NAME_(name, SUFFIX)
@@ -150,6 +151,8 @@
 #   define v_load(x)        _mm256_loadu_si256((vec_t *)(x))
 #   define v_set1           _mm256_set1_epi8
 #   define v_and            _mm256_and_si256
+#   define v_or             _mm256_or_si256
+#   define v_add            _mm256_add_epi8
 
 #   define v_test_bit(input, bit)                                           \
         _mm256_movemask_epi8(_mm256_slli_epi16((input), 7 - (bit)))
@@ -166,6 +169,7 @@
                 v_and(_mm256_srli_epi16((index), (shift)), v_set1(0x0F)))
 
 #   define v_testz          _mm256_testz_si256
+#   define v_test_any(x)    !_mm256_testz_si256((x), (x))
 
 // Simple macro to make a vector lookup table for use with vpshufb. Since
 // AVX2 is two 16-byte halves, we duplicate the input values.
@@ -189,7 +193,7 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
 
 // AVX512 definitions
 
-#   define SUFFIX           avx512
+#   define SUFFIX           avx512_vbmi
 
 #   define V_LEN            (64)
 
@@ -207,7 +211,10 @@ typedef struct {
 #   define v_load(x)        _mm512_loadu_si512((vec_t *)(x))
 #   define v_set1           _mm512_set1_epi8
 #   define v_and            _mm512_and_si512
+#   define v_or             _mm512_or_si512
 #   define v_testz          !_mm512_test_epi8_mask
+#   define v_test_any(x)    _mm512_test_epi8_mask((x), (x))
+#   define v_add            _mm512_add_epi8
 
 #   define v_test_bit(input, bit)                                           \
         _mm512_test_epi8_mask((input), v_set1((uint32_t)1 << (bit)))
@@ -220,6 +227,10 @@ typedef struct {
 #   define v_lookup(table, index, shift)                                    \
         _mm512_permutexvar_epi8((shift) ?                                   \
                 _mm512_srli_epi16((index), (shift)) : (index), (table))
+
+#   define v_lookup_64(table, index)                                    \
+        _mm512_permutexvar_epi8((index), (table))
+
 #else
 
 #   define v_lookup(table, index, shift)                                    \
@@ -231,6 +242,8 @@ typedef struct {
 
 #   define V_TABLE_16(...)    _mm512_setr_epi8(__VA_ARGS__, __VA_ARGS__, \
         __VA_ARGS__, __VA_ARGS__)
+
+#   define V_TABLE_64(...)    _mm512_setr_epi8(__VA_ARGS__)
 
 // Hack around setr_epi8 not being available
 #   define _mm512_setr_epi8(...) \
@@ -273,7 +286,10 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
 #   define v_load(x)        _mm_lddqu_si128((vec_t *)(x))
 #   define v_set1           _mm_set1_epi8
 #   define v_and            _mm_and_si128
+#   define v_or             _mm_or_si128
 #   define v_testz          _mm_test_all_zeros
+#   define v_test_any(x)    !_mm_test_all_zeros((x), (x))
+#   define v_add            _mm_add_epi8
 
 #   define v_test_bit(input, bit)                                           \
         _mm_movemask_epi8(_mm_slli_epi16((input), (uint8_t)(7 - (bit))))
@@ -403,8 +419,6 @@ static inline vmask2_t NAME(v_reduce_shift_7)(vec_t input) {
 
 #endif
 
-#include "table.h"
-
 #if defined(NEON)
 
 static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
@@ -442,6 +456,7 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
             );
             v_req = v_lookup(req_table, bytes, 4);
         } else {
+#include "table.h"
             v_req = v_lookup(error_1, bytes, 4);
             const vec_t valid_req = v_set1(0x2B);
             v_req = v_and(v_req, valid_req);
@@ -484,7 +499,7 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
         // Mark continuation bytes: those that have the high bit set but
         // not the next one
         if (n == 1)
-#if 0//defined(AVX512_VBMI)
+#if 0 && defined(AVX512_VBMI)
             cont = _kxor_mask64(high, set);
 #else
             cont = high ^ set;
@@ -506,7 +521,7 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
 #if defined(AVX512_VBMI)
         req.lo += set << n;
         //req.hi = _kor_mask64(req.hi, _kshiftri_mask64(set, 64-n));
-        req.hi |= set >> (64-n);
+        req.hi += set >> (64-n);
 #else
         req += (vmask2_t)set << n;
 #endif
@@ -538,6 +553,16 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
 
 #endif
 
+#if defined(AVX512_VBMI)
+#define PERM1   0
+#define PERM2   0
+#define PERM3   1
+#else
+#define PERM1   0
+#define PERM2   0
+#define PERM3   0
+#endif
+
 // Validate one vector's worth of input bytes
 static inline vec_t NAME(z_validate_special)(vec_t bytes, vec_t shifted_bytes) {
 //    // Error lookup tables for the first, second, and third nibbles
@@ -559,7 +584,41 @@ static inline vec_t NAME(z_validate_special)(vec_t bytes, vec_t shifted_bytes) {
 //        0x2B, 0x33, 0x35, 0x35,
 //        0x31, 0x31, 0x31, 0x31
 //    );
+#include "table.h"
 
+#if PERM2
+    vmask_t high = v_test_bit(shifted_bytes, 7);
+
+    vec_t e_1 = _mm512_maskz_permutex2var_epi8(high, error_64_1, shifted_bytes, error_64_2);
+    vec_t e_2 = _mm512_permutexvar_epi8(_mm512_srli_epi16(bytes, 4), error_64_3);
+
+    // Check if any bits are set in all three error masks
+    return v_and(e_1, e_2);
+
+#elif PERM1
+    // Look up error masks for three consecutive nibbles.
+    vec_t e_1 = _mm512_permutexvar_epi8(_mm512_srli_epi16(shifted_bytes, 2), error_64_1);
+    // Bitwise select
+    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF),
+            _mm512_slli_epi16(shifted_bytes, 4),
+            _mm512_srli_epi16(bytes, 4), 0xAC);
+    //vec_t e_2 = _mm512_permutex2var_epi8(error_64_2, index_2, error_64_3);
+    vec_t e_2 = _mm512_permutexvar_epi8(index_2, error_64_2);
+
+    // Check if any bits are set in all three error masks
+    return v_and(e_1, e_2);
+#elif PERM3
+    // Look up error masks for three consecutive nibbles.
+    vec_t e_1 = _mm512_permutexvar_epi8(shifted_bytes, error_64_1);
+    // Bitwise select
+    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF),
+            _mm512_srli_epi16(shifted_bytes, 2),
+            _mm512_srli_epi16(bytes, 4), 0xAC);
+    vec_t e_2 = _mm512_permutexvar_epi8(index_2, error_64_2);
+
+    // Check if any bits are set in all three error masks
+    return v_and(e_1, e_2);
+#else
     // Look up error masks for three consecutive nibbles.
     vec_t e_1 = v_lookup(error_1, shifted_bytes, 4);
     vec_t e_2 = v_lookup(error_2, shifted_bytes, 0);
@@ -567,6 +626,7 @@ static inline vec_t NAME(z_validate_special)(vec_t bytes, vec_t shifted_bytes) {
 
     // Check if any bits are set in all three error masks
     return v_and(v_and(e_1, e_2), e_3);
+#endif
 }
 
 int NAME(z_validate_utf8)(const char *data, size_t len) {
@@ -585,7 +645,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // use vector instructions.
         shifted_bytes = NAME(v_shift_lanes_left)(v_load(data));
 
-#define CHUNK_LEN       (4)
+#define CHUNK_LEN       (8)
 #define CHUNK_SIZE      (CHUNK_LEN * V_LEN)
 
     // Quick skip for ascii-only input. If there are no bytes with the high bit
@@ -606,16 +666,14 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
             }
 
             // Compute ASCII check for all vectors
-            uint64_t all_ascii = 0;
+            vec_t ascii_vec = v_set1(0);
             for (uint32_t i = 0; i < CHUNK_LEN; i++)
-                //all_ascii |= v_test_bit(byte_vecs[i], 7);
-                all_ascii |= v_test_any(v_and(byte_vecs[i], v_set1(0x80)));
+                ascii_vec = v_or(ascii_vec, byte_vecs[i]);
 
-            if (UNLIKELY(!all_ascii)) {
+            if (LIKELY(v_testz(ascii_vec, v_set1(0x80)))) {
                 if (last_cont != 0)
                     return 0;
-                else
-                    continue;
+                continue;
             }
 
             // Run other validations
@@ -675,7 +733,13 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 #undef v_load
 #undef v_set1
 #undef v_and
+#undef v_or
 #undef v_test_bit
 #undef v_testz
+#undef v_test_any
+#undef v_mask_test_bit
 #undef v_lookup
 #undef V_TABLE_16
+
+#undef PERM1
+#undef PERM2

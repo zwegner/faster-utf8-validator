@@ -1,5 +1,6 @@
 def rules(ctx):
-    cc = 'gcc-8.4'
+    #cc = 'gcc-8.4'
+    cc = 'cc'
     files = ['z_validate']
     gen_dir = '_out/gen'
     c_flags = [#'-fcolor-diagnostics',
