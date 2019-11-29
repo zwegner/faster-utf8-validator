@@ -82,6 +82,11 @@ local TEST_CASES = {
     { false, { 0xF5, 0xFF }, ANY },
     { false, { 0xF5, 0xFF }, ANY, ANY },
     { false, { 0xF5, 0xFF }, ANY, ANY, ANY },
+
+    -- No consecutive leader bytes
+    { false, { 0xC0, 0xF4 }, { 0xC0, 0xF4 }, CONT },
+    { false, { 0xC0, 0xF4 }, { 0xC0, 0xF4 }, CONT, CONT },
+    { false, { 0xC0, 0xF4 }, { 0xC0, 0xF4 }, CONT, CONT, CONT },
 }
 
 -- Array string
