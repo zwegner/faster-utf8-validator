@@ -176,7 +176,6 @@
         _mm256_shuffle_epi8((table),                                        \
                 v_and(_mm256_srli_epi16((index), (shift)), v_set1(0x0F)))
 
-#   define v_testz          _mm256_testz_si256
 #   define v_test_any(x)    !_mm256_testz_si256((x), (x))
 
 // Simple macro to make a vector lookup table for use with vpshufb. Since
@@ -184,16 +183,17 @@
 
 #   define V_TABLE_16(...)    _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
 
-// Move all the bytes in "input" to the left by one and fill in the first byte
-// with zero. Since AVX2 generally works on two separate 16-byte vectors glued
-// together, this needs two steps. The permute2x128 takes the middle 32 bytes
-// of the 64-byte concatenation v_zero:input. The align then gives the final
-// result in each half:
-//      top half: input_L:input_H --> input_L[15]:input_H[0:14]
-//   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
-static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
+static inline vec_t NAME(v_load_shift_first)(const char *data) {
+    vec_t input = v_load(data);
     vec_t zero = v_set1(0);
-    vec_t shl_16 = _mm256_permute2x128_si256(input, zero, 0x03);
+    // Move all the bytes in "input" to the left by one and fill in the first
+    // byte with zero. Since AVX2 generally works on two separate 16-byte
+    // vectors glued together, this needs two steps. The permute2x128 takes the
+    // middle 32 bytes of the 64-byte concatenation v_zero:input. The align
+    // then gives the final result in each half:
+    //      top half: input_L:input_H --> input_L[15]:input_H[0:14]
+    //   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
+    vec_t shl_16 = _mm256_permute2x128_si256(v_load(data), zero, 0x03);
     return _mm256_alignr_epi8(input, shl_16, 15);
 }
 
@@ -220,7 +220,6 @@ typedef struct {
 #   define v_set1           _mm512_set1_epi8
 #   define v_and            _mm512_and_si512
 #   define v_or             _mm512_or_si512
-#   define v_testz          !_mm512_test_epi8_mask
 #   define v_test_any(x)    _mm512_test_epi8_mask((x), (x))
 #   define v_add            _mm512_add_epi8
 
@@ -231,20 +230,12 @@ typedef struct {
         do { (mask) = _mm512_mask_test_epi8_mask((mask), (input),           \
                 v_set1((uint32_t)1 << (bit))); } while (0)
 
-#if 1
 #   define v_lookup(table, index, shift)                                    \
         _mm512_permutexvar_epi8((shift) ?                                   \
                 _mm512_srli_epi16((index), (shift)) : (index), (table))
 
 #   define v_lookup_64(table, index)                                    \
         _mm512_permutexvar_epi8((index), (table))
-
-#else
-
-#   define v_lookup(table, index, shift)                                    \
-        _mm512_shuffle_epi8((table),                                        \
-                v_and(_mm512_srli_epi16((index), (shift)), v_set1(0x0F)))
-#endif
 
 // Same macro as for AVX2, but repeated four times
 
@@ -257,26 +248,19 @@ typedef struct {
 #   define _mm512_setr_epi8(...) \
         (__extension__ (__m512i)(__v64qi) { __VA_ARGS__ } )
 
-// Shift all bytes left by one. We do this by using a permute with shuffle
-// indices that each point forward one byte. The first byte is filled in with
-// zero by using the maskz variant of the permute, which zeroes out bytes which
-// aren't set in the mask (which is all ones except for the first bit). This is
-// a bit annoying due to the big hardcoded lookup table, but oh well. Maybe it
-// can be done in some better way...
-static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
-    vec_t shift_indices = _mm512_setr_epi8(
-         0, 0, 1, 2, 3, 4, 5, 6,
-         7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,
-        23,24,25,26,27,28,29,30,
-        31,32,33,34,35,36,37,38,
-        39,40,41,42,43,44,45,46,
-        47,48,49,50,51,52,53,54,
-        55,56,57,58,59,60,61,62
-    );
+// Load from the "data" pointer, but shifted one byte forward. We want to do
+// this without touching memory before the pointer, since it might be unmapped.
+// Rather than mucking around with permutes or something to do this, we can use
+// a mask register to load starting from [data - 1], without actually loading
+// into the first byte of the vector (which is set to zero due to the _maskz
+// load variant). This will not fault if [data - 1] is invalid memory. Intel's
+// docs are rather vague here, just mentioning that masked loads have "fault
+// suppression", but this in fact means that lanes not in the mask cannot
+// trigger page faults. See: https://stackoverflow.com/questions/54497141
+static inline vec_t NAME(v_load_shift_first)(const char *data) {
     // All bits but the first
     __mmask64 shift_mask = ~1ULL;
-    return _mm512_maskz_permutexvar_epi8(shift_mask, shift_indices, input);
+    return _mm512_maskz_loadu_epi8(shift_mask, data - 1);
 }
 
 #elif defined(SSE4)
@@ -295,7 +279,6 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
 #   define v_set1           _mm_set1_epi8
 #   define v_and            _mm_and_si128
 #   define v_or             _mm_or_si128
-#   define v_testz          _mm_test_all_zeros
 #   define v_test_any(x)    !_mm_test_all_zeros((x), (x))
 #   define v_add            _mm_add_epi8
 
@@ -311,8 +294,8 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
 
 #   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
-static inline vec_t NAME(v_shift_lanes_left)(vec_t top) {
-    return _mm_alignr_epi8(top, v_set1(0), 15);
+static inline vec_t NAME(v_load_shift_first)(const char *data) {
+    return _mm_alignr_epi8(v_load(data), v_set1(0), 15);
 }
 
 #elif defined(NEON)
@@ -331,17 +314,11 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t top) {
 #   define v_set1           vdupq_n_u8
 #   define v_and            vandq_u8
 #   define v_or             vorrq_u8
-#   define v_testz          NAME(_v_testz)
 #   define v_test_any       NAME(_v_test_any)
 
 static inline uint64_t NAME(_v_test_any)(vec_t vec) {
     uint32x2_t sat_32 = vqmovn_u64(vreinterpretq_u64_u8(vec));
     return vget_lane_u64(vreinterpret_u64_u32(sat_32), 0);
-}
-
-static inline uint64_t NAME(_v_testz)(vec_t vec, vec_t ____vec2) {
-    (void)____vec2;
-    return !NAME(_v_test_any)(vec);
 }
 
 #   define v_test_bit(input, bit)                                           \
@@ -356,8 +333,8 @@ static inline uint64_t NAME(_v_testz)(vec_t vec, vec_t ____vec2) {
 
 #   define V_TABLE_16(...)  ( (uint8x16_t) { __VA_ARGS__ } )
 
-static inline vec_t NAME(v_shift_lanes_left)(vec_t top) {
-    return vextq_u8(v_set1(0), top, 15);
+static inline vec_t NAME(v_load_shift_first)(const char *data) {
+    return vextq_u8(v_set1(0), v_load(data), 15);
 }
 
 #define DEBUG(x)    //x
@@ -499,7 +476,7 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_by
 
 #elif defined(AVX512_VBMI)
 
-static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_bytes, vmask_t *last_cont) {
+static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vec_t shifted_bytes, vmask_t *last_cont) {
     // Which bytes are required to be continuation bytes
     vmask2_t req = {*last_cont, 0};
     // A bitmask of the actual continuation bytes in the input
@@ -507,9 +484,9 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_by
 
 #include "table.h"
     // XXX this should be CSEd out
-    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF),
+    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF0),
             _mm512_srli_epi16(shifted_bytes, 2),
-            _mm512_srli_epi16(bytes, 4), 0xAC);
+            _mm512_srli_epi16(bytes, 4), 0xCA);
     vec_t e_2 = _mm512_permutexvar_epi8(index_2, error_64_2);
 
     (void)error_64_1;
@@ -626,9 +603,9 @@ static inline vec_t NAME(z_validate_special)(vec_t bytes, vec_t shifted_bytes) {
     // Look up error masks for three consecutive nibbles.
     vec_t e_1 = _mm512_permutexvar_epi8(_mm512_srli_epi16(shifted_bytes, 2), error_64_1);
     // Bitwise select
-    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF),
+    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF0),
             _mm512_slli_epi16(shifted_bytes, 4),
-            _mm512_srli_epi16(bytes, 4), 0xAC);
+            _mm512_srli_epi16(bytes, 4), 0xCA);
     //vec_t e_2 = _mm512_permutex2var_epi8(error_64_2, index_2, error_64_3);
     vec_t e_2 = _mm512_permutexvar_epi8(index_2, error_64_2);
 
@@ -638,9 +615,9 @@ static inline vec_t NAME(z_validate_special)(vec_t bytes, vec_t shifted_bytes) {
     // Look up error masks for three consecutive nibbles.
     vec_t e_1 = _mm512_permutexvar_epi8(shifted_bytes, error_64_1);
     // Bitwise select
-    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF),
+    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF0),
             _mm512_srli_epi16(shifted_bytes, 2),
-            _mm512_srli_epi16(bytes, 4), 0xAC);
+            _mm512_srli_epi16(bytes, 4), 0xCA);
     vec_t e_2 = _mm512_permutexvar_epi8(index_2, error_64_2);
 
     // Check if any bits are set in all three error masks
@@ -670,7 +647,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // Since we don't want to read the memory before the data pointer
         // (which might not even be mapped), for the first chunk of input just
         // use vector instructions.
-        shifted_bytes = NAME(v_shift_lanes_left)(v_load(data));
+        shifted_bytes = NAME(v_load_shift_first)(data);
 
 #define CHUNK_LEN       (8)
 #define CHUNK_SIZE      (CHUNK_LEN * V_LEN)
@@ -698,7 +675,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
             for (uint32_t i = 0; i < CHUNK_LEN; i++)
                 ascii_vec = v_or(ascii_vec, byte_vecs[i]);
 
-            if (LIKELY(v_testz(ascii_vec, v_set1(0x80)))) {
+            if (LIKELY(!v_test_bit(ascii_vec, 7))) {
                 if (last_cont != 0)
                     return 0;
                 continue;
@@ -769,7 +746,6 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 #undef v_and
 #undef v_or
 #undef v_test_bit
-#undef v_testz
 #undef v_test_any
 #undef v_mask_test_bit
 #undef v_lookup
