@@ -129,9 +129,17 @@
 #define LIKELY(x)           __builtin_expect((x), (1))
 #define UNLIKELY(x)         __builtin_expect((x), (0))
 
-#define NAME_(name, suff) name##_##suff
-#define NAME__(name, SUFFIX)     NAME_(name, SUFFIX)
-#define NAME(name)     NAME__(name, SUFFIX)
+#define UNUSED              __attribute__((unused))
+
+#if defined(ASCII_CHECK)
+#   define ASCII            _ascii
+#else
+#   define ASCII
+#endif
+
+#define NAME_(name, suff, ascii)    name##_##suff##ascii
+#define NAME__(name, suff, ascii)   NAME_(name, suff, ascii)
+#define NAME(name)                  NAME__(name, SUFFIX, ASCII)
 
 #if defined(AVX2)
 
@@ -202,11 +210,11 @@ static inline vec_t NAME(v_shift_lanes_left)(vec_t input) {
 
 typedef struct {
     __mmask64 lo, hi;
-} v_avx512_mask2_t;
+} NAME(vmask2_t);
 
 #   define vec_t            __m512i
 #   define vmask_t          __mmask64
-#   define vmask2_t         v_avx512_mask2_t
+#   define vmask2_t         NAME(vmask2_t)
 
 #   define v_load(x)        _mm512_loadu_si512((vec_t *)(x))
 #   define v_set1           _mm512_set1_epi8
@@ -419,9 +427,23 @@ static inline vmask2_t NAME(v_reduce_shift_7)(vec_t input) {
 
 #endif
 
+#undef PERM1
+#undef PERM2
+#undef PERM3
+
+#if defined(AVX512_VBMI)
+#define PERM1   0
+#define PERM2   0
+#define PERM3   1
+#else
+#define PERM1   0
+#define PERM2   0
+#define PERM3   0
+#endif
+
 #if defined(NEON)
 
-static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
+static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_bytes, vmask_t *last_cont) {
     vmask2_t req, error;
     if (0) {
         const vec_t req_table = V_TABLE_16(
@@ -475,35 +497,26 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
     return error;
 }
 
-#else
+#elif defined(AVX512_VBMI)
 
-static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
-    vmask_t high = v_test_bit(bytes, 7);
-
+static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_bytes, vmask_t *last_cont) {
     // Which bytes are required to be continuation bytes
-#if defined(AVX512_VBMI)
     vmask2_t req = {*last_cont, 0};
-#else
-    vmask2_t req = *last_cont;
-#endif
     // A bitmask of the actual continuation bytes in the input
     vmask_t cont;
 
-    // Compute the continuation byte mask by finding bytes that start with
-    // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
-    // and shift it forward by 1, 2, or 3. This loop should be unrolled by
-    // the compiler, and the (n == 1) branch inside eliminated.
-    vmask_t set = high;
-    for (int n = 1; n <= 3; n++) {
-        v_mask_test_bit(set, bytes, 7 - n);
-        // Mark continuation bytes: those that have the high bit set but
-        // not the next one
-        if (n == 1)
-#if 0 && defined(AVX512_VBMI)
-            cont = _kxor_mask64(high, set);
-#else
-            cont = high ^ set;
-#endif
+#include "table.h"
+    // XXX this should be CSEd out
+    vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF),
+            _mm512_srli_epi16(shifted_bytes, 2),
+            _mm512_srli_epi16(bytes, 4), 0xAC);
+    vec_t e_2 = _mm512_permutexvar_epi8(index_2, error_64_2);
+
+    (void)error_64_1;
+    cont = v_test_bit(e_2, 7);
+
+    for (int n = 2; n <= 3; n++) {
+        vmask_t set = _mm512_cmp_epu8_mask(bytes, v_set1(0xFF << (7-n)), _MM_CMPINT_NLT);
 
         // We add the shifted mask here instead of ORing it, which would
         // be the more natural operation, so that this line can be done
@@ -518,49 +531,63 @@ static inline vmask_t NAME(z_validate_cont)(vec_t bytes, vmask_t *last_cont) {
         // will be cleared by a carry). This leader byte will not be
         // in the continuation mask, despite being required. QEDish.
 
-#if defined(AVX512_VBMI)
         req.lo += set << n;
-        //req.hi = _kor_mask64(req.hi, _kshiftri_mask64(set, 64-n));
         req.hi += set >> (64-n);
-#else
-        req += (vmask2_t)set << n;
-#endif
     }
+
+    // Save continuation bits and input bytes for the next round
+    *last_cont = req.hi;
+
+    return (cont ^ req.lo);
+}
+
+#else
+
+static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_bytes, vmask_t *last_cont) {
+    // Which bytes are required to be continuation bytes
+    vmask2_t req = *last_cont;
+    // A bitmask of the actual continuation bytes in the input
+    vmask_t cont;
+
+    // Compute the continuation byte mask by finding bytes that start with
+    // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
+    // and shift it forward by 1, 2, or 3. This loop should be unrolled by
+    // the compiler, and the (n == 1) branch inside eliminated.
+    vmask_t high = v_test_bit(bytes, 7);
+    vmask_t set = high;
+
+    for (int n = 1; n <= 3; n++) {
+        v_mask_test_bit(set, bytes, 7 - n);
+
+        // Mark continuation bytes: those that have the high bit set but
+        // not the next one
+        if (n == 1)
+            cont = high ^ set;
+
+        // We add the shifted mask here instead of ORing it, which would
+        // be the more natural operation, so that this line can be done
+        // with one lea. While adding could give a different result due
+        // to carries, this will only happen for invalid UTF-8 sequences,
+        // and in a way that won't cause it to pass validation. Reasoning:
+        // Any bits for required continuation bytes come after the bits
+        // for their leader bytes, and are all contiguous. For a carry to
+        // happen, two of these bit sequences would have to overlap. If
+        // this is the case, there is a leader byte before the second set
+        // of required continuation bytes (and thus before the bit that
+        // will be cleared by a carry). This leader byte will not be
+        // in the continuation mask, despite being required. QEDish.
+        req += (vmask2_t)set << n;
+    }
+
+    // Save continuation bits and input bytes for the next round
+    *last_cont = req >> V_LEN;
+
     // Check that continuation bytes match. We must cast req from vmask2_t
     // (which holds the carry mask in the upper half) to vmask_t, which
     // zeroes out the upper bits
-//#if defined(AVX512_VBMI)
-//    if (cont != req.lo)
-//#else
-//    if (cont != (vmask_t)req)
-//#endif
-//        return 0;
-
-    // Save continuation bits and input bytes for the next round
-#if defined(AVX512_VBMI)
-    *last_cont = req.hi;
-#else
-    *last_cont = req >> V_LEN;
-#endif
-
-#if defined(AVX512_VBMI)
-    //return _kor_mask64(*mask_error, _kxor_mask64(cont, req.lo));
-    return (cont ^ req.lo);
-#else
     return (cont ^ (vmask_t)req);
-#endif
 }
 
-#endif
-
-#if defined(AVX512_VBMI)
-#define PERM1   0
-#define PERM2   0
-#define PERM3   1
-#else
-#define PERM1   0
-#define PERM2   0
-#define PERM3   0
 #endif
 
 // Validate one vector's worth of input bytes
@@ -665,6 +692,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
                 shifted_bytes = v_load(d + V_LEN - 1);
             }
 
+#if defined(ASCII_CHECK)
             // Compute ASCII check for all vectors
             vec_t ascii_vec = v_set1(0);
             for (uint32_t i = 0; i < CHUNK_LEN; i++)
@@ -675,12 +703,13 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
                     return 0;
                 continue;
             }
+#endif
 
             // Run other validations
             vmask_t all_c_error = 0;
             vec_t all_v_error = v_set1(0);
             for (uint32_t i = 0; i < CHUNK_LEN; i++) {
-                vmask_t c_error = NAME(z_validate_cont)(byte_vecs[i], &last_cont);
+                vmask_t c_error = NAME(z_validate_cont)(byte_vecs[i], sh_byte_vecs[i], &last_cont);
                 vec_t v_error = NAME(z_validate_special)(byte_vecs[i], sh_byte_vecs[i]);
                 all_c_error |= c_error;
                 all_v_error = v_or(all_v_error, v_error);
@@ -694,7 +723,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // that far into memory
         for (; offset + V_LEN < len; offset += V_LEN) {
             bytes = v_load(data + offset);
-            vmask_t c_error = NAME(z_validate_cont)(bytes, &last_cont);
+            vmask_t c_error = NAME(z_validate_cont)(bytes, shifted_bytes, &last_cont);
             vec_t v_error = NAME(z_validate_special)(bytes, shifted_bytes);
             if (UNLIKELY(c_error || v_test_any(v_error)))
                 return 0;
@@ -712,11 +741,16 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 
         bytes = v_load(buffer + 1);
         shifted_bytes = v_load(buffer);
-        vmask_t c_error = NAME(z_validate_cont)(bytes, &last_cont);
+        vmask_t c_error = NAME(z_validate_cont)(bytes, shifted_bytes, &last_cont);
         vec_t v_error = NAME(z_validate_special)(bytes, shifted_bytes);
         if (UNLIKELY(c_error || v_test_any(v_error)))
             return 0;
     }
+
+#if defined(AVX512_VBMI)
+    if (len > 0 && (uint8_t)data[len - 1] > 0xB0)
+        return 0;
+#endif
 
     // The input is valid if we don't have any more expected continuation bytes
     return last_cont == 0;

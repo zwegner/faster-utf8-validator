@@ -27,16 +27,16 @@ local CONT = { 0x80, 0xBF }
 -- are 2-element tables { lo, hi }. For each byte, all byte values between the
 -- corresponding lo and hi values are tested.
 local TEST_CASES = {
-    -- ASCII. First byte is ' ' for keeping combinatorial explosions down
+    -- ASCII
     {  true, ASCII, ASCII, ASCII, ASCII },
 
     -- 2-byte sequences
-    { false, { 0xC2, 0xC2 }, },
-    { false, { 0xC2, 0xC2 }, ASCII },
-    {  true, { 0xC2, 0xC2 }, CONT },
-    { false, { 0xC2, 0xC2 }, { 0xC0, 0xFF} },
-    { false, { 0xC2, 0xC2 }, CONT, CONT },
-    { false, { 0xC2, 0xC2 }, CONT, CONT, CONT },
+    { false, { 0xC2, 0xDF }, },
+    { false, { 0xC2, 0xDF }, ASCII },
+    {  true, { 0xC2, 0xDF }, CONT },
+    { false, { 0xC2, 0xDF }, { 0xC0, 0xFF} },
+    { false, { 0xC2, 0xDF }, CONT, CONT },
+    { false, { 0xC2, 0xDF }, CONT, CONT, CONT },
 
     -- 3-byte sequences
     { false, { 0xE1, 0xE1 }, },
