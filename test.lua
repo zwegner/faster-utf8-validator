@@ -1,6 +1,6 @@
 -- Load the library
 local ffi = require('ffi')
-local lib_avx512 = ffi.load('_out/avx512/rel/zval.so')
+--local lib_avx512 = ffi.load('_out/avx512/rel/zval.so')
 local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
 local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
 --local lib_neon = ffi.load('_out/neon/rel/zval.so')
@@ -12,7 +12,7 @@ bool z_validate_utf8_neon(const char *data, size_t len);
 ]])
 
 local VALIDATORS = {
-    ['avx512'] = lib_avx512.z_validate_utf8_avx512_vbmi,
+    --['avx512'] = lib_avx512.z_validate_utf8_avx512_vbmi,
     ['avx2']   = lib_avx2.z_validate_utf8_avx2,
     ['sse4']   = lib_sse4.z_validate_utf8_sse4,
 --    ['neon']   = lib_neon.z_validate_utf8_neon,

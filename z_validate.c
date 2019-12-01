@@ -524,8 +524,9 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // and shift it forward by 1, 2, or 3. This loop should be unrolled by
     // the compiler, and the (n == 1) branch inside eliminated.
     // XXX more hardcoded bits--these pick out 0xEx and 0xFx, that is,
-    vmask_t leader_3 = v_test_bit(e_1, 2);
-    vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), 7);
+    vec_t bit_6 = v_add(e_1, e_1);
+    vmask_t leader_3 = v_test_bit(e_1, 5);
+    vmask_t leader_4 = v_test_bit(bit_6, 7);
 
     // We add the shifted mask here instead of ORing it, which would
     // be the more natural operation, so that this line can be done
@@ -539,8 +540,8 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // of required continuation bytes (and thus before the bit that
     // will be cleared by a carry). This leader byte will not be
     // in the continuation mask, despite being required. QEDish.
-    req += (vmask2_t)leader_3 * 2;
-    req += (vmask2_t)leader_4 * 6;
+    req += (vmask2_t)(leader_3 + leader_4) << 1;
+    req += (vmask2_t)leader_4 << 2;
 
     // Save continuation bits and input bytes for the next round
     *last_cont = req >> V_LEN;
@@ -570,7 +571,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // use vector instructions.
         shifted_bytes = NAME(v_load_shift_first)(data);
 
-#define CHUNK_LEN       (8)
+#define CHUNK_LEN       (4)
 #define CHUNK_SIZE      (CHUNK_LEN * V_LEN)
 
         for (; offset + CHUNK_SIZE < len; offset += CHUNK_SIZE) {
@@ -594,6 +595,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
             if (LIKELY(!v_test_bit(ascii_vec, 7))) {
                 if (last_cont != 0)
                     return 0;
+
                 continue;
             }
 #endif
@@ -601,6 +603,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
             // Run other validations
             result_t result = { v_set1(0), 0 };
             for (uint32_t i = 0; i < CHUNK_LEN; i++) {
+
                 result_t r = NAME(z_validate_vec)(byte_vecs[i],
                         sh_byte_vecs[i], &last_cont);
                 result.v_error = v_or(result.v_error, r.v_error);
