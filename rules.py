@@ -1,6 +1,7 @@
 def rules(ctx):
-    #cc = 'gcc-8.4'
-    cc = 'gcc-9'
+    cc = 'gcc-8.4'
+    objdump = 'objdump'
+    #cc = 'gcc-9'
     files = ['z_validate']
     gen_dir = '_out/gen'
     c_flags = [#'-fcolor-diagnostics',
@@ -51,4 +52,4 @@ def rules(ctx):
         asm_out = '_out/%s/zval.s' % conf_path
         args = '-Mintel' if 'neon' not in conf_path else ''
         ctx.add_rule(asm_out, [main_obj], ['sh', '-c',
-            'gobjdump -d %s %s > %s' % (args, main_obj, asm_out)])
+            '%s -d %s %s > %s' % (objdump, args, main_obj, asm_out)])

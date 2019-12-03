@@ -23,6 +23,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <stdio.h>
+
 #if defined(NEON)
 #   include <arm_neon.h>
 #else
@@ -131,7 +133,7 @@
 
 #define UNUSED              __attribute__((unused))
 
-#define DEBUG(x)            x
+#define DEBUG(x)            //x
 
 #if defined(ASCII_CHECK)
 #   define ASCII            _ascii
@@ -300,21 +302,36 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 #   define V_LEN            (16)
 
 #   define vec_t            uint8x16_t
-#   define vmask_t          uint32_t
-#   define vmask2_t         uint64_t
+#   define vmask_t          uint8x16_t
+// no vmask2_t
 
 #   define v_load(x)        vld1q_u8((uint8_t *)(x))
 #   define v_set1           vdupq_n_u8
 #   define v_and            vandq_u8
 #   define v_or             vorrq_u8
+#   define v_xor            veorq_u8
+#   define v_shl(x, shift)  ((shift) ? vshlq_n_u8((x), (shift)) : (x))
+#   define v_shr(x, shift)  ((shift) ? vshrq_n_u8((x), (shift)) : (x))
 
 #   define v_test_any       NAME(_v_test_any)
 #   define v_test_bit(input, bit)                                           \
-        _mm_movemask_epi8(vshlq_n_u8((input), (uint8_t)(7 - (bit))))
+        v_test_any(v_and((input), v_set1((uint8_t)(1 << (bit)))))
+
+//#   define result_fails(r)                                                   \
+//            (v_test_any(v_or(v_and((r).cont_error, v_set1(1 << MARK_CONT)), \
+//                             (r).lookup_error)))
+
+#   define result_fails(r)                                                  \
+            (v_test_any(v_and((r).cont_error, v_set1(1 << MARK_CONT))) ||   \
+             v_test_any((r).lookup_error))
+
+#   define test_end_cont(r)                                                 \
+        v_test_any(v_and((r), V_TABLE_16(0,0,0,0,0,0,0,0,0,0,0,0,0,0,       \
+                        1 << ERR_MAX2, 1 << ERR_MAX2 | 1 << ERR_SURR)))
 
 static inline uint64_t NAME(_v_test_any)(vec_t vec) {
-    uint32x2_t sat_32 = vqmovn_u64(vreinterpretq_u64_u8(vec));
-    return vget_lane_u64(vreinterpret_u64_u32(sat_32), 0);
+    uint64x2_t vec_64 = (uint64x2_t)vec;
+    return vgetq_lane_u64(vec_64, 0) | vgetq_lane_u64(vec_64, 1);
 }
 
 #   define v_lookup(table, index, shift)                                    \
@@ -327,53 +344,37 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
     return vextq_u8(v_set1(0), v_load(data), 15);
 }
 
-static inline vmask2_t NAME(v_reduce_shift_6)(vec_t input) {
-    const vec_t mask_8  = V_TABLE_16(-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0);
-    const vec_t mask_16 = V_TABLE_16(-1,-1,0,0,-1,-1,0,0,-1,-1,0,0,-1,-1,0,0);
-
-    uint16x8_t input_16 = (uint16x8_t)input;
-
-    uint8x16_t sum_32_8 = (uint8x16_t)vsraq_n_u16(input_16, input_16, 6);
-    uint32x4_t sum_32   = (uint32x4_t)v_and(sum_32_8, mask_8);
-    uint8x16_t sum_64_8 = (uint8x16_t)vsraq_n_u32(sum_32, sum_32, 12);
-    uint64x2_t sum_64   = (uint64x2_t)v_and(sum_64_8, mask_16);
-
-    uint32x4_t lanes_32 = (uint32x4_t)vsraq_n_u64(sum_64, sum_64, 24);
-
-    DEBUG(
-        printf("reduce:\n");
-        NAME(print_vec)(vreinterpretq_u8_u32(sum_32));
-        NAME(print_vec)(vreinterpretq_u8_u64(sum_64));
-        NAME(print_vec)(vreinterpretq_u8_u32(lanes_32));
-        printf("  end=%lx\n",
-            vgetq_lane_u32(lanes_32, 0) | ((uint64_t)vgetq_lane_u32(lanes_32, 2) << 16));
-    )
-
-    // note _u32 and 2 here
-    return vgetq_lane_u32(lanes_32, 0) | ((uint64_t)vgetq_lane_u32(lanes_32, 2) << 16);
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
+    return vextq_u8(bottom, top, 16 - n);
 }
 
-static inline vmask2_t NAME(v_reduce_shift_7)(vec_t input) {
-    const vec_t mask = V_TABLE_16(-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0,-1,0);
+static void __attribute__((unused)) NAME(print_vec)(vec_t a);
 
-    //printf("reduce:\n");
-    uint16x8_t input16 = vreinterpretq_u16_u8(input);
-    // This part copy+pasted from the stack overflow answer
-    uint32x4_t paired16 = vreinterpretq_u32_u16(
-                              vsraq_n_u16(input16, input16, 7));
-    paired16 = vreinterpretq_u32_u8(v_and(mask, vreinterpretq_u8_u32(paired16)));
-    //NAME(print_vec)(vreinterpretq_u8_u32(paired16));
-    uint64x2_t paired32 = vreinterpretq_u64_u32(
-                              vsraq_n_u32(paired16, paired16, 14));
-    //NAME(print_vec)(vreinterpretq_u8_u64(paired32));
-    uint16x8_t paired64 = vreinterpretq_u16_u64(
-                              vsraq_n_u64(paired32, paired32, 28));
-    //NAME(print_vec)(vreinterpretq_u8_u16(paired64));
-    //printf("  end=%u\n",
-        //vgetq_lane_u16(paired64, 0) | ((int)vgetq_lane_u16(paired64, 4) << 8));
-    // note _u16 and 4 here
-    return vgetq_lane_u16(paired64, 0) | ((int)vgetq_lane_u16(paired64, 4) << 8);
-}
+//static inline vmask2_t NAME(v_reduce_shift_6)(vec_t input) {
+//    const vec_t mask_8  = V_TABLE_16(-2,1,-2,1,-2,1,-2,1,-2,1,-2,1,-2,1,-2,1);
+//    const vec_t mask_16 = V_TABLE_16(-2,-1,1,0,-2,-1,1,0,-2,-1,1,0,-2,-1,1,0);
+//
+//    uint16x8_t input_16 = (uint16x8_t)input;
+//
+//    uint8x16_t sum_32_8 = (uint8x16_t)vsraq_n_u16(input_16, input_16, 6);
+//    uint32x4_t sum_32   = (uint32x4_t)v_and(sum_32_8, mask_8);
+//    uint8x16_t sum_64_8 = (uint8x16_t)vsraq_n_u32(sum_32, sum_32, 12);
+//    uint64x2_t sum_64   = (uint64x2_t)v_and(sum_64_8, mask_16);
+//
+//    uint32x4_t lanes_32 = (uint32x4_t)vsraq_n_u64(sum_64, sum_64, 24);
+//
+//    DEBUG(
+//        printf("reduce:\n");
+//        NAME(print_vec)(vreinterpretq_u8_u32(sum_32));
+//        NAME(print_vec)(vreinterpretq_u8_u64(sum_64));
+//        NAME(print_vec)(vreinterpretq_u8_u32(lanes_32));
+//        printf("  end=%lx\n",
+//            vgetq_lane_u32(lanes_32, 0) | ((uint64_t)vgetq_lane_u32(lanes_32, 2) << 16));
+//    )
+//
+//    // note _u32 and 2 here
+//    return vgetq_lane_u32(lanes_32, 0) | ((uint64_t)vgetq_lane_u32(lanes_32, 2) << 16);
+//}
 
 #else
 
@@ -385,11 +386,10 @@ static inline vmask2_t NAME(v_reduce_shift_7)(vec_t input) {
 #define result_t    NAME(_result_t)
 
 typedef struct {
-    vec_t v_error;
-    vmask_t m_error;
+    vec_t lookup_error;
+    vmask_t cont_error;
 } result_t;
 
-#include <stdio.h>
 static void __attribute__((unused)) NAME(print_vec)(vec_t a) {
     char buf[V_LEN];
     *(vec_t *)buf = a;
@@ -398,63 +398,6 @@ static void __attribute__((unused)) NAME(print_vec)(vec_t a) {
         printf("%2x,", buf[i] & 0xff);
     printf("}\n");
 }
-
-#if defined(NEON)
-
-static inline vmask_t NAME(z_validate_cont)(vec_t bytes, UNUSED vec_t shifted_bytes, vmask_t *last_cont) {
-    vmask2_t req, error;
-    if (0) {
-        const vec_t req_table = V_TABLE_16(
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x01, 0x01, 0x01, 0x01,
-            0x02, 0x02, 0x06, 0x0E
-        );
-
-        const vec_t ones = v_set1(1);
-        const vec_t valid_req = v_set1(0x0E);
-
-        vec_t v_req = v_lookup(req_table, bytes, 4);
-        vec_t v_cont = v_and(v_req, ones);
-        v_req = v_and(v_req, valid_req);
-
-        DEBUG(NAME(print_vec)(v_req);)
-        DEBUG(NAME(print_vec)(v_cont);)
-
-        req = NAME(v_reduce_shift_7)(v_req) | *last_cont;
-        vmask_t cont = NAME(v_reduce_shift_7)(v_cont);
-        error = (uint16_t)(cont ^ req);
-        *last_cont = (uint16_t)(req >> V_LEN);
-    } else {
-        vec_t v_req;
-        if (1) {
-            const vec_t req_table = V_TABLE_16(
-                0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00,
-                0x01, 0x01, 0x01, 0x01,
-                0x02, 0x02, 0x0A, 0x2A
-            );
-            v_req = v_lookup(req_table, bytes, 4);
-        } else {
-#include "table.h"
-            v_req = v_lookup(error_1, bytes, 4);
-            const vec_t valid_req = v_set1(0x2B);
-            v_req = v_and(v_req, valid_req);
-        }
-
-        DEBUG(NAME(print_vec)(bytes);)
-        DEBUG(NAME(print_vec)(v_req);)
-        req = (NAME(v_reduce_shift_6)(v_req) << 1) | *last_cont;
-
-        DEBUG(printf("req: %lx\n", req);)
-        error = ((req >> 1) ^ req) & 0x55555555;
-        DEBUG(printf("error: %x\n", error);)
-
-        *last_cont = req >> V_LEN*2;
-    }
-    return error;
-}
-#endif
 
 // Validate one vector's worth of input bytes
 static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
@@ -469,20 +412,19 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     vmask2_t req = { *last_cont, 0 };
 
     // Look up error masks for three consecutive nibbles
-    vec_t e_1 = v_lookup_64(error_64_1, shifted_bytes);
+    vec_t e_1 = v_lookup_64(error_1, shifted_bytes);
     // Bitwise select
     vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF0),
             _mm512_srli_epi16(shifted_bytes, 2),
             _mm512_srli_epi16(bytes, 4), 0xCA);
-    vec_t e_2 = v_lookup_64(error_64_2, index_2);
+    vec_t e_2 = v_lookup_64(error_2, index_2);
 
     // Check if any bits are set in all three error masks
-    result.v_error = v_and(e_1, e_2);
+    result.lookup_error = v_and(e_1, e_2);
 
     // Get a bitmask of all continuation bytes in the input. We can cheat a bit
     // (in a fun way) by hiding the bit in the error lookup tables.
-    // XXX hardcoded offset of bit 7 for continuation bytes
-    vmask_t cont = v_test_bit(e_2, 7);
+    vmask_t cont = v_test_bit(e_2, MARK_CONT);
 
     for (int n = 2; n <= 3; n++) {
         vmask_t set = _mm512_cmpge_epu8_mask(bytes, v_set1(0xFF << (7-n)));
@@ -495,7 +437,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // Save continuation bits and input bytes for the next round
     *last_cont = req.hi;
 
-    result.m_error = (cont ^ req.lo);
+    result.cont_error = (cont ^ req.lo);
 
 #else
 
@@ -512,21 +454,70 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     vec_t e_1_3 = v_and(e_1, e_3);
 
     // Create the result vector with any bits are set in all three error masks
-    result.v_error = v_and(e_1_3, e_2);
+    result.lookup_error = v_and(e_1_3, e_2);
+
+#if defined(NEON)
+
+//    vec_t v_req;
+//    //const vec_t req_table = V_TABLE_16(
+//    //    0x00, 0x00, 0x00, 0x00,
+//    //    0x00, 0x00, 0x00, 0x00,
+//    //    //0x01, 0x01, 0x01, 0x01,
+//    //    //0x02, 0x02, 0x0A, 0x2A
+//    //    0x02, 0x02, 0x02, 0x02,
+//    //    0x04, 0x04, 0x14, 0x54
+//    //);
+//    //v_req = v_lookup(req_table, bytes, 4);
+//    v_req = v_and(e_1, v_set1(0x56));
+//    //v_req = v_and(v_lookup(error_1, bytes, 4), v_set1(0x2B));
+//    //v_req = v_and(v_lookup(error_1, bytes, 4), v_set1(0x56));
+//
+//    DEBUG(NAME(print_vec)(bytes);)
+//    DEBUG(NAME(print_vec)(v_req);)
+//    //vmask2_t req = (NAME(v_reduce_shift_6)(v_req) << 2) | *last_cont;
+//    vmask2_t req = NAME(v_reduce_shift_6)(v_req) | *last_cont;
+//
+//    DEBUG(printf("req: %lx\n", req);)
+//    result.cont_error = ((req >> 1) ^ req) & 0x55555555;
+//
+//    DEBUG(printf("error: %x\n", result.cont_error);)
+//
+//    *last_cont = req >> V_LEN*2;
+
+    vec_t shift_1 = NAME(v_shift_lanes)(*last_cont, e_1, 1);
+    vec_t shift_2 = NAME(v_shift_lanes)(*last_cont, e_1, 2);
+    vec_t req_3 = v_shr(shift_1, ERR_SURR - MARK_CONT);
+    vec_t req_4 = vsraq_n_u8(req_3, shift_2, ERR_MAX2 - MARK_CONT);
+
+    result.cont_error = v_xor(req_4, e_1_3);
+
+    DEBUG(printf("input\n");)
+    DEBUG(NAME(print_vec)(bytes);)
+    DEBUG(NAME(print_vec)(*last_cont);)
+    DEBUG(printf("masks\n");)
+    DEBUG(NAME(print_vec)(e_1);)
+    DEBUG(NAME(print_vec)(e_1_3);)
+    DEBUG(NAME(print_vec)(req_3);)
+    DEBUG(NAME(print_vec)(req_4);)
+    DEBUG(NAME(print_vec)(req);)
+    DEBUG(printf("error\n");)
+    DEBUG(NAME(print_vec)(result.cont_error);)
+
+    *last_cont = e_1;
+
+#else
 
     // req is a mask of what bytes are required to be continuation bytes after
     // the first, and cont is a mask of the continuation bytes after the first
     vmask2_t req = *last_cont;
-    vmask_t cont = v_test_bit(e_1_3, 7);
+    vmask_t cont = v_test_bit(e_1_3, MARK_CONT);
 
     // Compute the continuation byte mask by finding bytes that start with
     // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
     // and shift it forward by 1, 2, or 3. This loop should be unrolled by
     // the compiler, and the (n == 1) branch inside eliminated.
-    // XXX more hardcoded bits--these pick out 0xEx and 0xFx, that is,
-    vec_t bit_6 = v_add(e_1, e_1);
-    vmask_t leader_3 = v_test_bit(e_1, 5);
-    vmask_t leader_4 = v_test_bit(bit_6, 7);
+    vmask_t leader_3 = v_test_bit(e_1, ERR_SURR);
+    vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), ERR_MAX2+1);
 
     // We add the shifted mask here instead of ORing it, which would
     // be the more natural operation, so that this line can be done
@@ -540,7 +531,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // of required continuation bytes (and thus before the bit that
     // will be cleared by a carry). This leader byte will not be
     // in the continuation mask, despite being required. QEDish.
-    req += (vmask2_t)(leader_3 + leader_4) << 1;
+    req += (vmask2_t)leader_3 << 1;
     req += (vmask2_t)leader_4 << 2;
 
     // Save continuation bits and input bytes for the next round
@@ -549,18 +540,21 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // Check that continuation bytes match. We must cast req from vmask2_t
     // (which holds the carry mask in the upper half) to vmask_t, which
     // zeroes out the upper bits
-    result.m_error = (cont ^ (vmask_t)req);
+    result.cont_error = (cont ^ (vmask_t)req);
+
+#endif
+
 #endif
 
     return result;
 }
 
 int NAME(z_validate_utf8)(const char *data, size_t len) {
-    vec_t bytes, shifted_bytes;
+    vec_t bytes, shifted_bytes, last_bytes = v_set1(0);
 
     // Keep continuation bits from the previous iteration that carry over to
     // each input chunk vector
-    vmask_t last_cont = 0;
+    vmask_t last_cont = v_set1(0);
 
     size_t offset = 0;
     // Deal with the input up until the last section of bytes
@@ -569,19 +563,21 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // Since we don't want to read the memory before the data pointer
         // (which might not even be mapped), for the first chunk of input just
         // use vector instructions.
-        shifted_bytes = NAME(v_load_shift_first)(data);
+        //shifted_bytes = NAME(v_load_shift_first)(data);
 
-#define CHUNK_LEN       (4)
+#define CHUNK_LEN       (8)
 #define CHUNK_SIZE      (CHUNK_LEN * V_LEN)
 
-        for (; offset + CHUNK_SIZE < len; offset += CHUNK_SIZE) {
+        for (; offset + CHUNK_SIZE + V_LEN < len; offset += CHUNK_SIZE) {
             vec_t byte_vecs[CHUNK_LEN];
             vec_t sh_byte_vecs[CHUNK_LEN];
             for (uint32_t i = 0; i < CHUNK_LEN; i++) {
                 const char *d = data + offset + i * V_LEN;
                 byte_vecs[i] = v_load(d);
-                sh_byte_vecs[i] = shifted_bytes;
-                shifted_bytes = v_load(d + V_LEN - 1);
+                sh_byte_vecs[i] = NAME(v_shift_lanes)(last_bytes, byte_vecs[i], 1);
+                last_bytes = byte_vecs[i];
+                //sh_byte_vecs[i] = shifted_bytes;
+                //shifted_bytes = v_load(d + V_LEN - 1);
             }
 
 #if defined(ASCII_CHECK)
@@ -593,7 +589,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
                 ascii_vec = v_or(ascii_vec, byte_vecs[i]);
 
             if (LIKELY(!v_test_bit(ascii_vec, 7))) {
-                if (last_cont != 0)
+                if (test_end_cont(last_cont))
                     return 0;
 
                 continue;
@@ -601,16 +597,18 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 #endif
 
             // Run other validations
-            result_t result = { v_set1(0), 0 };
-            for (uint32_t i = 0; i < CHUNK_LEN; i++) {
-
+            //result_t result = { v_set1(0), v_set1(0) };
+            result_t result = NAME(z_validate_vec)(byte_vecs[0],
+                    sh_byte_vecs[0], &last_cont);
+            for (uint32_t i = 1; i < CHUNK_LEN; i++) {
                 result_t r = NAME(z_validate_vec)(byte_vecs[i],
                         sh_byte_vecs[i], &last_cont);
-                result.v_error = v_or(result.v_error, r.v_error);
-                result.m_error |= r.m_error;
+                result.lookup_error = v_or(result.lookup_error, r.lookup_error);
+                //result.cont_error |= r.cont_error;
+                result.cont_error = v_or(result.cont_error, r.cont_error);
             }
 
-            if (UNLIKELY(result.m_error || v_test_any(result.v_error)))
+            if (UNLIKELY(result_fails(result)))
                 return 0;
         }
 
@@ -618,11 +616,14 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // that far into memory
         for (; offset + V_LEN < len; offset += V_LEN) {
             bytes = v_load(data + offset);
+            shifted_bytes = NAME(v_shift_lanes)(last_bytes, bytes, 1);
+
             result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
                     &last_cont);
-            if (UNLIKELY(result.m_error || v_test_any(result.v_error)))
+            if (UNLIKELY(result_fails(result)))
                 return 0;
-            shifted_bytes = v_load(data + offset + V_LEN - 1);
+            //shifted_bytes = v_load(data + offset + V_LEN - 1);
+            last_bytes = bytes;
         }
     }
     // Deal with any bytes remaining. Rather than making a separate scalar path,
@@ -638,7 +639,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         shifted_bytes = v_load(buffer);
         result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
                 &last_cont);
-        if (UNLIKELY(result.m_error || v_test_any(result.v_error)))
+        if (UNLIKELY(result_fails(result)))
             return 0;
     }
 
@@ -652,7 +653,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         return 0;
 
     // The input is valid if we don't have any more expected continuation bytes
-    return last_cont == 0;
+    return !test_end_cont(last_cont);
 }
 
 // Undefine all macros
