@@ -187,18 +187,20 @@
 
 #   define V_TABLE_16(...)    _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
 
+// Move all the bytes in "input" to the left by one and fill in the first
+// byte with zero. Since AVX2 generally works on two separate 16-byte
+// vectors glued together, this needs two steps. The permute2x128 takes the
+// middle 32 bytes of the 64-byte concatenation v_zero:input. The align
+// then gives the final result in each half:
+//      top half: input_L:input_H --> input_L[15]:input_H[0:14]
+//   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
+    vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
+    return _mm256_alignr_epi8(top, shl_16, 16 - n);
+}
+
 static inline vec_t NAME(v_load_shift_first)(const char *data) {
-    vec_t input = v_load(data);
-    vec_t zero = v_set1(0);
-    // Move all the bytes in "input" to the left by one and fill in the first
-    // byte with zero. Since AVX2 generally works on two separate 16-byte
-    // vectors glued together, this needs two steps. The permute2x128 takes the
-    // middle 32 bytes of the 64-byte concatenation v_zero:input. The align
-    // then gives the final result in each half:
-    //      top half: input_L:input_H --> input_L[15]:input_H[0:14]
-    //   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
-    vec_t shl_16 = _mm256_permute2x128_si256(v_load(data), zero, 0x03);
-    return _mm256_alignr_epi8(input, shl_16, 15);
+    return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
 }
 
 #elif defined(AVX512_VBMI)
@@ -244,6 +246,10 @@ typedef struct {
 // Hack around setr_epi8 not being available
 #   define _mm512_setr_epi8(...) \
         (__extension__ (__m512i)(__v64qi) { __VA_ARGS__ } )
+
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
+    return _mm_alignr_epi8(bottom, top, 16 - n);
+}
 
 // Load from the "data" pointer, but shifted one byte forward. We want to do
 // this without touching memory before the pointer, since it might be unmapped.
@@ -291,8 +297,12 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 
 #   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
+    return _mm_alignr_epi8(bottom, top, 16 - n);
+}
+
 static inline vec_t NAME(v_load_shift_first)(const char *data) {
-    return _mm_alignr_epi8(v_load(data), v_set1(0), 15);
+    return NAME(v_shift_lanes)(v_load(data), v_set1(0), 1);
 }
 
 #elif defined(NEON)
@@ -326,18 +336,20 @@ static inline uint64_t NAME(_v_test_any)(vec_t vec) {
     return vgetq_lane_u64(vec_64, 0) | vgetq_lane_u64(vec_64, 1);
 }
 
+// This logic is specific for 0/4 bit shifts--the masking of the low four bits
+// is only necessary if shift < 4 (and thus some high bits might be set)
 #   define v_lookup(table, index, shift)                                    \
         vqtbl1q_u8((table), (shift) ? vshrq_n_u8((index), (shift)) :        \
                 v_and((index), v_set1(0x0F)))
 
 #   define V_TABLE_16(...)  ( (uint8x16_t) { __VA_ARGS__ } )
 
-static inline vec_t NAME(v_load_shift_first)(const char *data) {
-    return vextq_u8(v_set1(0), v_load(data), 15);
-}
-
 static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
     return vextq_u8(bottom, top, 16 - n);
+}
+
+static inline vec_t NAME(v_load_shift_first)(const char *data) {
+    return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
 }
 
 #else
@@ -351,7 +363,6 @@ static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
 // errors into one result, so we can easily unroll the inner loop and only
 // branch once for several vectors' worth of results.
 #define result_t    NAME(_result_t)
-
 typedef struct {
     vec_t lookup_error;
     vmask_t cont_error;
@@ -359,6 +370,7 @@ typedef struct {
 
 // Some code paths for result checking are common between all x86 ISAs and
 // different on NEON. These are collected here.
+
 #if !defined(NEON)
 #   define vmask_or(a, b)       ((a) | (b))
 #   define test_carry_req(r)    ((r) != 0)
@@ -383,6 +395,30 @@ typedef struct {
             (v_test_any(v_and((r).cont_error, v_set1(1 << MARK_CONT))) ||   \
              v_test_any((r).lookup_error))
 #endif
+
+#define state_t     NAME(_state_t)
+typedef struct {
+    vec_t bytes;
+    vec_t shifted_bytes;
+    vec_t last_bytes;
+    vec_t next_shifted_bytes;
+} state_t;
+
+static inline void NAME(load_first)(state_t *state, const char *data) {
+    state->next_shifted_bytes = NAME(v_load_shift_first)(data);
+    state->bytes = v_set1(0);
+}
+
+static inline void NAME(load_next)(state_t *state, const char *data) {
+    state->last_bytes = state->bytes;
+    state->bytes = v_load(data);
+#if 1 || defined(USE_UNALIGNED_LOADS)
+    state->shifted_bytes = state->next_shifted_bytes;
+    state->next_shifted_bytes = v_load(data + V_LEN - 1);
+#else
+    state->shifted_bytes = NAME(v_shift_lanes)(state->last_bytes, state->bytes, 1);
+#endif
+}
 
 static void UNUSED NAME(print_vec)(vec_t a) {
     char buf[V_LEN];
@@ -517,8 +553,6 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
 }
 
 int NAME(z_validate_utf8)(const char *data, size_t len) {
-    vec_t bytes, shifted_bytes, last_bytes = v_set1(0);
-
     // Keep continuation bits from the previous iteration that carry over to
     // each input chunk vector
     vmask_t carry_req = v_set1(0);
@@ -530,45 +564,49 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // Since we don't want to read the memory before the data pointer
         // (which might not even be mapped), for the first chunk of input just
         // use vector instructions.
-        //shifted_bytes = NAME(v_load_shift_first)(data);
+        state_t state[1];
+        NAME(load_first)(state, data);
 
-#define CHUNK_LEN       (8)
-#define CHUNK_SIZE      (CHUNK_LEN * V_LEN)
+#define UNROLL_COUNT    (8)
+#define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
-        for (; offset + CHUNK_SIZE + V_LEN < len; offset += CHUNK_SIZE) {
-            vec_t byte_vecs[CHUNK_LEN];
-            vec_t sh_byte_vecs[CHUNK_LEN];
-            for (uint32_t i = 0; i < CHUNK_LEN; i++) {
-                const char *d = data + offset + i * V_LEN;
-                byte_vecs[i] = v_load(d);
-                sh_byte_vecs[i] = NAME(v_shift_lanes)(last_bytes, byte_vecs[i], 1);
-                last_bytes = byte_vecs[i];
-                //sh_byte_vecs[i] = shifted_bytes;
-                //shifted_bytes = v_load(d + V_LEN - 1);
-            }
+        for (; offset + UNROLL_SIZE + V_LEN - 1 < len; offset += UNROLL_SIZE) {
+            vec_t byte_vecs[UNROLL_COUNT];
+            for (uint32_t i = 0; i < UNROLL_COUNT; i++)
+                byte_vecs[i] = v_load(data + offset + i * V_LEN);
 
 #if defined(ASCII_CHECK)
             // Quick skip for ASCII-only input. If there are no bytes with the
             // high bit set, we can skip this chunk. If we expected any
             // continuation bytes here, we return invalid, otherwise just skip.
-            vec_t ascii_vec = v_set1(0);
-            for (uint32_t i = 0; i < CHUNK_LEN; i++)
+            vec_t ascii_vec = byte_vecs[0];
+            for (uint32_t i = 1; i < UNROLL_COUNT; i++)
                 ascii_vec = v_or(ascii_vec, byte_vecs[i]);
 
             if (LIKELY(!v_test_bit(ascii_vec, 7))) {
                 if (test_carry_req(carry_req))
                     return 0;
 
+                // Set up the state for the next iteration by loading the last
+                NAME(load_next)(state, data + offset + (UNROLL_COUNT-1) * V_LEN);
                 continue;
             }
 #endif
+
+            // Load all the vectors for the unrolled chunk
+            vec_t sh_byte_vecs[UNROLL_COUNT];
+            for (uint32_t i = 0; i < UNROLL_COUNT; i++) {
+                NAME(load_next)(state, data + offset + i * V_LEN);
+                byte_vecs[i] = state->bytes;
+                sh_byte_vecs[i] = state->shifted_bytes;
+            }
 
             // Run other validations. Annoyingly, at least one compiler (GCC 8)
             // doesn't optimize v_or(0, x) into x, so manually unroll the first
             // iteration
             result_t result = NAME(z_validate_vec)(byte_vecs[0],
                     sh_byte_vecs[0], &carry_req);
-            for (uint32_t i = 1; i < CHUNK_LEN; i++) {
+            for (uint32_t i = 1; i < UNROLL_COUNT; i++) {
                 result_t r = NAME(z_validate_vec)(byte_vecs[i],
                         sh_byte_vecs[i], &carry_req);
                 result.lookup_error = v_or(result.lookup_error, r.lookup_error);
@@ -582,15 +620,12 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // Loop over input in V_LEN-byte chunks, as long as we can safely read
         // that far into memory
         for (; offset + V_LEN < len; offset += V_LEN) {
-            bytes = v_load(data + offset);
-            shifted_bytes = NAME(v_shift_lanes)(last_bytes, bytes, 1);
+            NAME(load_next)(state, data + offset);
 
-            result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
-                    &carry_req);
+            result_t result = NAME(z_validate_vec)(state->bytes,
+                    state->shifted_bytes, &carry_req);
             if (UNLIKELY(result_fails(result)))
                 return 0;
-            //shifted_bytes = v_load(data + offset + V_LEN - 1);
-            last_bytes = bytes;
         }
     }
     // Deal with any bytes remaining. Rather than making a separate scalar path,
@@ -602,8 +637,8 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         for (int i = 0; i < (int)(len - offset); i++)
             buffer[i + 1] = data[offset + i];
 
-        bytes = v_load(buffer + 1);
-        shifted_bytes = v_load(buffer);
+        vec_t bytes = v_load(buffer + 1);
+        vec_t shifted_bytes = v_load(buffer);
         result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
                 &carry_req);
         if (UNLIKELY(result_fails(result)))
