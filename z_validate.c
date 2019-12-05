@@ -23,6 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <assert.h>
 #include <stdio.h>
 
 #if defined(NEON)
@@ -194,9 +195,12 @@
 // then gives the final result in each half:
 //      top half: input_L:input_H --> input_L[15]:input_H[0:14]
 //   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
+
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+    (void)n;
+    //assert(n == 1, "unsupported lane shift");
     vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
-    return _mm256_alignr_epi8(top, shl_16, 16 - n);
+    return _mm256_alignr_epi8(top, shl_16, 16 - 1);
 }
 
 static inline vec_t NAME(v_load_shift_first)(const char *data) {
@@ -247,8 +251,7 @@ typedef struct {
 #   define _mm512_setr_epi8(...) \
         (__extension__ (__m512i)(__v64qi) { __VA_ARGS__ } )
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
-    return _mm_alignr_epi8(bottom, top, 16 - n);
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
 }
 
 // Load from the "data" pointer, but shifted one byte forward. We want to do
@@ -297,8 +300,9 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 
 #   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
-    return _mm_alignr_epi8(bottom, top, 16 - n);
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+    (void)n;
+    return _mm_alignr_epi8(bottom, top, 16 - 1);
 }
 
 static inline vec_t NAME(v_load_shift_first)(const char *data) {
@@ -344,7 +348,7 @@ static inline uint64_t NAME(_v_test_any)(vec_t vec) {
 
 #   define V_TABLE_16(...)  ( (uint8x16_t) { __VA_ARGS__ } )
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, uint32_t n) {
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
     return vextq_u8(bottom, top, 16 - n);
 }
 
@@ -375,7 +379,7 @@ typedef struct {
 #   define vmask_or(a, b)       ((a) | (b))
 #   define test_carry_req(r)    ((r) != 0)
 #   define result_fails(r)                                                  \
-            (v_test_any((r).cont_error) || (r).lookup_error != 0)
+            ((r).cont_error != 0 || v_test_any((r).lookup_error))
 #else
 #   define vmask_or         v_or
 // In the NEON code paths, we keep continuation byte masks as vectors, and need
@@ -385,7 +389,7 @@ typedef struct {
 // the continuation marker bits are already shifted forward by one (due to
 // coming from the special case error lookups), the last two positions are
 // sufficient to catch any expected continuation bytes at the end.
-#   define test_carry_req(r)                                                 \
+#   define test_carry_req(r)                                                \
         v_test_any(v_and((r), V_TABLE_16(0,0,0,0,0,0,0,0,0,0,0,0,0,0,       \
                         1 << ERR_MAX2, 1 << ERR_MAX2 | 1 << ERR_SURR)))
 // Mask out everything but the MARK_CONT bit from the cont_error. This is
@@ -412,7 +416,7 @@ static inline void NAME(load_first)(state_t *state, const char *data) {
 static inline void NAME(load_next)(state_t *state, const char *data) {
     state->last_bytes = state->bytes;
     state->bytes = v_load(data);
-#if 1 || defined(USE_UNALIGNED_LOADS)
+#if 1
     state->shifted_bytes = state->next_shifted_bytes;
     state->next_shifted_bytes = v_load(data + V_LEN - 1);
 #else
@@ -483,7 +487,8 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // subexpression used for ANDing all three nibbles, but is also used for
     // finding continuation bytes after the first. The continuation bit is
     // only set in this mask if both the first and third nibbles correspond to
-    // continuation bytes, so we 
+    // continuation bytes, so the first continuation byte after a leader byte
+    // won't be checked.
     vec_t e_1_3 = v_and(e_1, e_3);
 
     // Create the result vector with any bits are set in all three error masks
@@ -534,8 +539,8 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // of required continuation bytes (and thus before the bit that
     // will be cleared by a carry). This leader byte will not be
     // in the continuation mask, despite being required. QEDish.
-    req += (vmask2_t)leader_3 << 1;
     req += (vmask2_t)leader_4 << 2;
+    req += (vmask2_t)leader_3 << 1;
 
     // Save continuation bits and input bytes for the next round
     *carry_req = req >> V_LEN;
@@ -555,7 +560,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
 int NAME(z_validate_utf8)(const char *data, size_t len) {
     // Keep continuation bits from the previous iteration that carry over to
     // each input chunk vector
-    vmask_t carry_req = v_set1(0);
+    vmask_t carry_req = 0;//v_set1(0);
 
     size_t offset = 0;
     // Deal with the input up until the last section of bytes
@@ -567,15 +572,17 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         state_t state[1];
         NAME(load_first)(state, data);
 
-#define UNROLL_COUNT    (8)
+#define UNROLL_COUNT    (4)
 #define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
         for (; offset + UNROLL_SIZE + V_LEN - 1 < len; offset += UNROLL_SIZE) {
             vec_t byte_vecs[UNROLL_COUNT];
+            vec_t sh_byte_vecs[UNROLL_COUNT];
+
+#if defined(ASCII_CHECK)
             for (uint32_t i = 0; i < UNROLL_COUNT; i++)
                 byte_vecs[i] = v_load(data + offset + i * V_LEN);
 
-#if defined(ASCII_CHECK)
             // Quick skip for ASCII-only input. If there are no bytes with the
             // high bit set, we can skip this chunk. If we expected any
             // continuation bytes here, we return invalid, otherwise just skip.
@@ -594,12 +601,14 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 #endif
 
             // Load all the vectors for the unrolled chunk
-            vec_t sh_byte_vecs[UNROLL_COUNT];
-            for (uint32_t i = 0; i < UNROLL_COUNT; i++) {
-                NAME(load_next)(state, data + offset + i * V_LEN);
-                byte_vecs[i] = state->bytes;
-                sh_byte_vecs[i] = state->shifted_bytes;
-            }
+//            for (uint32_t i = 0; i < UNROLL_COUNT; i++) {
+//                NAME(load_next)(state, data + offset + i * V_LEN);
+//                byte_vecs[i] = state->bytes;
+//                sh_byte_vecs[i] = state->shifted_bytes;
+//            }
+            NAME(load_next)(state, data + offset + 0 * V_LEN);
+            byte_vecs[0] = state->bytes;
+            sh_byte_vecs[0] = state->shifted_bytes;
 
             // Run other validations. Annoyingly, at least one compiler (GCC 8)
             // doesn't optimize v_or(0, x) into x, so manually unroll the first
@@ -607,6 +616,11 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
             result_t result = NAME(z_validate_vec)(byte_vecs[0],
                     sh_byte_vecs[0], &carry_req);
             for (uint32_t i = 1; i < UNROLL_COUNT; i++) {
+
+                NAME(load_next)(state, data + offset + i * V_LEN);
+                byte_vecs[i] = state->bytes;
+                sh_byte_vecs[i] = state->shifted_bytes;
+
                 result_t r = NAME(z_validate_vec)(byte_vecs[i],
                         sh_byte_vecs[i], &carry_req);
                 result.lookup_error = v_or(result.lookup_error, r.lookup_error);

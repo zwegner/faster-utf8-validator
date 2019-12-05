@@ -1,22 +1,29 @@
--- Load the library
 local ffi = require('ffi')
---local lib_avx512 = ffi.load('_out/avx512/rel/zval.so')
---local lib_avx2 = ffi.load('_out/avx2/rel/zval.so')
---local lib_sse4 = ffi.load('_out/sse4/rel/zval.so')
-local lib_neon = ffi.load('_out/neon/rel/zval.so')
-ffi.cdef([[
-bool z_validate_utf8_avx512_vbmi(const char *data, size_t len);
-bool z_validate_utf8_avx2(const char *data, size_t len);
-bool z_validate_utf8_sse4(const char *data, size_t len);
-bool z_validate_utf8_neon(const char *data, size_t len);
-]])
 
-local VALIDATORS = {
---    ['avx512'] = lib_avx512.z_validate_utf8_avx512_vbmi,
---    ['avx2']   = lib_avx2.z_validate_utf8_avx2,
---    ['sse4']   = lib_sse4.z_validate_utf8_sse4,
-    ['neon']   = lib_neon.z_validate_utf8_neon,
-}
+-- Parse arguments to see what arches we're testing
+local arches
+if arg[1] == 'neon' then
+    arches = {'neon'}
+else
+    arches = {'avx2', 'sse4'}
+    if arg[1] == 'avx512' then
+        table.insert(arches, 'avx512_vbmi')
+    end
+end
+
+-- Load libraries and create a table of all validator functions we're testing
+local libs = {}
+local VALIDATORS = {}
+for _, arch in ipairs(arches) do
+    local lib = ffi.load('_out/'..arch..'/rel/zval.so')
+    -- XXX keep a reference to the library, apparently the function reference
+    -- below isn't enough for luajit to keep the library from being gc'ed
+    table.insert(libs, lib)
+
+    local fn = 'z_validate_utf8_'..arch
+    ffi.cdef('bool '..fn..'(const char *data, size_t len);')
+    VALIDATORS[arch] = lib[fn]
+end
 
 -- Ranges for certain kinds of bytes
 local ANY = { 0, 0xFF }

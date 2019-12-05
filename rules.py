@@ -1,11 +1,13 @@
 def rules(ctx):
-    cc = 'gcc-8.4'
-    objdump = 'objdump'
-    #cc = 'gcc-9'
+    #cc = 'gcc-8.4'
+    cc = 'gcc-9'
+    #cc = 'cc'
+    #objdump = 'objdump'
+    objdump = 'gobjdump'
     files = ['z_validate']
     gen_dir = '_out/gen'
-    c_flags = [#'-fcolor-diagnostics',
- '-fPIC', '-std=gnu11', '-march=native', '-fdiagnostics-color=always',
+    c_flags = [
+ '-fPIC', '-std=c11', '-march=native', '-fdiagnostics-color=always',
  '-I%s' % gen_dir,
             '-Wall', '-Wextra', '-Werror']
 
@@ -14,8 +16,8 @@ def rules(ctx):
 #-Wa,-mattr=+avx512vbmi -Wa,-march=cannonlake -march=cannonlake -mavx512vbmi -mbmi2
 
     configs = [
-        ['avx512/rel', ['-DAVX512_VBMI', '-O3']],
-        ['avx512/deb', ['-DAVX512_VBMI', '-g']],
+        ['avx512_vbmi/rel', ['-DAVX512_VBMI', '-O3']],
+        ['avx512_vbmi/deb', ['-DAVX512_VBMI', '-g']],
         ['avx2/rel', ['-DAVX2', '-O3']],
         ['avx2/deb', ['-DAVX2', '-g']],
         ['sse4/rel', ['-DSSE4', '-O3']],
