@@ -64,10 +64,11 @@ error_nibbles = [
 # Bit maps: the different error bits are arranged differently for x86 and NEON
 # code. This is because NEON uses a completely different code path for
 # continuation byte testing, and thus we can make different tradeoffs that are
-# optimized for each ISA. Namely, for AVX2/SSE4 testing the high bit of each
-# byte in a vector is cheap with the vpmovmsk instruction--other bits require
-# a shift to get them to the top position (or an add to test the bit in the
-# next-to-highest position).
+# optimized for each ISA.
+
+# For AVX2/SSE4 testing the high bit of each byte in a vector is cheap with the
+# vpmovmskb instruction--other bits require a shift to get them to the top
+# position (or an add, if we're testing the second-highest bit).
 x86_bit_map = {
     'ERR_CONT':   0,
     'ERR_OVER1':  1,
@@ -84,11 +85,12 @@ x86_bit_map = {
 # forward to line up the leader bytes with the third and fourth byte. This is
 # possible by using the vector shift-right-and-accumulate instruction, which
 # is safe only if we don't need to worry about the other bits overflowing and
-# messing up our mask. So, by using MARK_CONT==1<<0, we can shift the 3/4-byte
-# markers into the low position and add them together, resulting in the XOR of
-# the two markers in the low bit. This only differs from OR when we have a
-# 3-byte leader followed by a 4-byte leader, which will already be detected as
-# illegal using the ERR_CONT bit.
+# messing up our mask. So, by making MARK_CONT the low bit, we can shift the
+# 3/4-byte markers into the low position and add them together, resulting in the
+# XOR of the two markers in the low bit. This only differs from OR when we have
+# a 3-byte leader followed by a 4-byte leader, which will already be detected as
+# illegal using the ERR_CONT bit. Besides MARK_CONT being 0, the ordering of the
+# other bits is not constrained in any way.
 neon_bit_map = {
     'ERR_CONT':   1,
     'ERR_OVER1':  2,
@@ -180,6 +182,10 @@ def make_64_bit_tables(error_bits, bit_map):
     # information. Make sure we can round-trip back to 16-entry tables.
     e_rt = [[0] * 16 for i in range(3)]
     for n in range(64):
+        # The second and third nibbles are easy: they both use the low four bits
+        # of their respective six-bit indices
+        e_rt[1][n & 0xF] |= error_bits_64[0][n]
+        e_rt[2][n & 0xF] |= error_bits_64[1][n]
         # Reconstrucing the first nibble is weird, since the bits are divided.
         # We loop over all possible values of both 64-bit indices, and set all
         # the bits that are set in both entries for all possible values that
@@ -196,9 +202,6 @@ def make_64_bit_tables(error_bits, bit_map):
             cont_bit = 1 << bit_map['MARK_CONT']
             e_rt[0][index_1] |= error_bits_64[1][n] & cont_bit
 
-        e_rt[1][n & 0xF] |= error_bits_64[0][n]
-        e_rt[2][n & 0xF] |= error_bits_64[1][n]
-
     assert error_bits == e_rt
 
     return error_bits_64
@@ -213,6 +216,9 @@ def write_table(f, table, bit_map):
                 for x in range(0, t_len, step))
         f.write('const vec_t error_%s = V_TABLE_%s(\n    %s\n);\n' %
                 (n+1, t_len, t))
+    # Add #defines for the names of the various bits. This is actually a lot
+    # uglier than it seems: we'd really want to use an enum, but this generated
+    # table.h is included locally
     for k in sorted(bit_map):
         f.write('#   undef %s\n' % k)
     for k, v in sorted(bit_map.items()):

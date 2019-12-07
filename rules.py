@@ -1,30 +1,18 @@
 def rules(ctx):
-    #cc = 'gcc-8.4'
-    cc = 'gcc-9'
-    #cc = 'cc'
-    #objdump = 'objdump'
-    objdump = 'gobjdump'
+    cc = ctx.vars.get('cc', 'cc')
+    objdump = ctx.vars.get('objdump', 'objdump')
     files = ['z_validate']
     gen_dir = '_out/gen'
-    c_flags = [
- '-fPIC', '-std=c11', '-march=native', '-fdiagnostics-color=always',
- '-I%s' % gen_dir,
-            '-Wall', '-Wextra', '-Werror']
+    c_flags = ['-I%s' % gen_dir, '-fPIC', '-std=c11', '-march=native',
+        '-fdiagnostics-color=always', '-Wall', '-Wextra', '-Werror']
 
-    #c_flags += ['-std=c++11']
-
-#-Wa,-mattr=+avx512vbmi -Wa,-march=cannonlake -march=cannonlake -mavx512vbmi -mbmi2
-
-    configs = [
-        ['avx512_vbmi/rel', ['-DAVX512_VBMI', '-O3']],
-        ['avx512_vbmi/deb', ['-DAVX512_VBMI', '-g']],
-        ['avx2/rel', ['-DAVX2', '-O3']],
-        ['avx2/deb', ['-DAVX2', '-g']],
-        ['sse4/rel', ['-DSSE4', '-O3']],
-        ['sse4/deb', ['-DSSE4', '-g']],
-        ['neon/rel', ['-DNEON', '-O3']],
-        ['neon/deb', ['-DNEON', '-g']],
-    ]
+    configs = []
+    for conf in ['avx512_vbmi', 'avx2', 'sse4', 'neon']:
+        opts = ['-D%s' % conf.upper()]
+        configs += [
+            ['%s/rel' % conf, opts + ['-O3']],
+            ['%s/deb' % conf, opts + ['-g']],
+        ]
 
     # Generated tables
     table_path = '%s/table.h' % gen_dir
@@ -34,7 +22,6 @@ def rules(ctx):
     for [conf_path, conf_flags] in configs:
         o_files = []
         for f in files:
-            #c_file = '%s.cpp' % f
             c_file = '%s.c' % f
             o_file = '_out/%s/%s.o' % (conf_path, f)
             d_file = '_out/%s/%s.d' % (conf_path, f)
