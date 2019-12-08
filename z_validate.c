@@ -166,10 +166,13 @@
 #   define vmask2_t         uint64_t
 
 //#   define v_load(x)        _mm256_maskload_epi32((int *)(x), v_set1(0x80))
+//#   define v_load(x)        _mm256_loadu_si256((vec_t *)(x))
+//#   define v_loadu(x)        _mm256_loadu_si256((vec_t *)(x))
 #   define v_load(x)        _mm256_load_si256((vec_t *)(x))
 #   define v_loadu(x)       _mm256_lddqu_si256((vec_t *)(x))
 #   define v_set1           _mm256_set1_epi8
 #   define v_and            _mm256_and_si256
+#   define v_andn           _mm256_andnot_si256
 #   define v_or             _mm256_or_si256
 #   define v_add            _mm256_add_epi32
 #   define v_shl(x, shift)  ((shift) ? _mm256_slli_epi16((x), (shift)) : (x))
@@ -183,9 +186,7 @@
 // for the lookup, because vpshufb has the neat "feature" that negative values
 // in an index byte will result in a zero.
 
-#   define v_lookup(table, index, shift)                                    \
-        _mm256_shuffle_epi8((table), v_and(v_shr((index), (shift)),         \
-                    v_set1(0x0F)))
+#   define v_lookup(table, index)   _mm256_shuffle_epi8((table), (index))
 
 // Simple macro to make a vector lookup table for use with vpshufb. Since
 // AVX2 is two 16-byte halves, we duplicate the input values.
@@ -292,6 +293,7 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 #   define v_loadu(x)       _mm_lddqu_si128((vec_t *)(x))
 #   define v_set1           _mm_set1_epi8
 #   define v_and            _mm_and_si128
+#   define v_andn           _mm_andnot_si128
 #   define v_or             _mm_or_si128
 #   define v_add            _mm_add_epi32
 #   define v_shl(x, shift)  ((shift) ? _mm_slli_epi16((x), (shift)) : (x))
@@ -301,8 +303,7 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 #   define v_test_bit(input, bit)                                           \
         _mm_movemask_epi8(v_shl((input), (uint8_t)(7 - (bit))))
 
-#   define v_lookup(table, index, shift)                                    \
-        _mm_shuffle_epi8((table), v_and(v_shr((index), (shift)), v_set1(0x0F)))
+#   define v_lookup(table, index)   _mm_shuffle_epi8((table), (index))
 
 #   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
@@ -346,11 +347,7 @@ static inline uint64_t NAME(_v_test_any)(vec_t vec) {
     return vgetq_lane_u64(vec_64, 0) | vgetq_lane_u64(vec_64, 1);
 }
 
-// This logic is specific for 0/4 bit shifts--the masking of the low four bits
-// is only necessary if shift < 4 (and thus some high bits might be set)
-#   define v_lookup(table, index, shift)                                    \
-        vqtbl1q_u8((table), (shift) ? vshrq_n_u8((index), (shift)) :        \
-                v_and((index), v_set1(0x0F)))
+#   define v_lookup(table, index)   vqtbl1q_u8((table), (index))
 
 #   define V_TABLE_16(...)  ( (uint8x16_t) { __VA_ARGS__ } )
 
@@ -505,21 +502,26 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
 
 #else
 
-    // Look up error masks for three consecutive nibbles
-    vec_t e_1 = v_lookup(error_1, shifted_bytes, 4);
-    vec_t e_2 = v_lookup(error_2, shifted_bytes, 0);
-    vec_t e_3 = v_lookup(error_3, bytes, 4);
+    // Look up error masks for three consecutive nibbles. Note that we need a
+    // special trick for the second nibble (as described in gen_table.py for
+    // the MARK_CONT2 bit). There, we invert shifted_bytes and AND with 0x8F
+    // with one AND NOT instruction, which zeroes out e_2 for ASCII input.
+    vec_t e_1 = v_lookup(error_1, v_and(v_shr(shifted_bytes, 4), v_set1(0x0F)));
+    vec_t e_2 = v_lookup(error_2, v_andn(shifted_bytes, v_set1(0x8F)));
+    vec_t e_3 = v_lookup(error_3, v_and(v_shr(bytes, 4), v_set1(0x0F)));
 
     // Get error bits common between the first and third nibbles. This is a
     // subexpression used for ANDing all three nibbles, but is also used for
-    // finding continuation bytes after the first. The continuation bit is
-    // only set in this mask if both the first and third nibbles correspond to
+    // finding continuation bytes after the first. The MARK_CONT bit is only
+    // set in this mask if both the first and third nibbles correspond to
     // continuation bytes, so the first continuation byte after a leader byte
     // won't be checked.
     vec_t e_1_3 = v_and(e_1, e_3);
 
-    // Create the result vector with any bits are set in all three error masks
-    result.lookup_error = v_and(e_1_3, e_2);
+    // Create the result vector with any bits are set in all three error masks.
+    // Note that we use AND NOT here, because the bits in e_2 are inverted--
+    // this is needed for ASCII->continuation to trigger the MARK_CONT2 error.
+    result.lookup_error = v_andn(e_2, e_1_3);
 
 #if defined(NEON)
 
@@ -552,7 +554,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // and shift it forward by 1, 2, or 3. This loop should be unrolled by
     // the compiler, and the (n == 1) branch inside eliminated.
     vmask_t leader_3 = v_test_bit(e_1, ERR_SURR);
-    vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), ERR_MAX2+1);
+    vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), ERR_MAX2 + 1);
 
     // We add the shifted mask here instead of ORing it, which would
     // be the more natural operation, so that this line can be done
@@ -726,6 +728,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 #undef v_loadu
 #undef v_set1
 #undef v_and
+#undef v_andn
 #undef v_or
 #undef v_add
 #undef v_shl

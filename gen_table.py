@@ -23,15 +23,19 @@
 
 import sys
 
+# Error nibble table. This table contains all the special case errors in UTF-8
+# bytes, specified by the values of the first, second, and third nibbles of each
+# invalid sequence (as described in z_validate.c). The entries have a friendly
+# name of an error bit (which is mapped differently for different architectures)
+# and the values of the three nibbles. Each nibble can either be a single value
+# or a range of values.
 error_nibbles = [
     # First continuation byte errors. Any byte following 0xCx..0xFx must be
-    # in the range 0x80..0xBF, and any byte following an ASCII byte must *not*
-    # be in the range 0x80..0xBF
+    # in the range 0x80..0xBF
     ['ERR_CONT',  [[0xC, 0xF], [0x0, 0xF], [0x0, 0x7]]],
     ['ERR_CONT',  [[0xC, 0xF], [0x0, 0xF], [0xC, 0xF]]],
 
-    #['ERR_SURR',  [[0x0, 0x7], [0x0, 0xF], [0x8, 0xB]]],
-
+    # All the "normal" special case errors
     ['ERR_OVER1', [ 0xC,       [0x0, 0x1], [0x0, 0xF]]],
     ['ERR_OVER2', [ 0xE,        0x0,       [0x8, 0x9]]],
     ['ERR_SURR',  [ 0xE,        0xD,       [0xA, 0xB]]],
@@ -58,11 +62,60 @@ error_nibbles = [
     # together means we only need to test the second and third continuation
     # bytes aside from the special case testing, since the first continuation
     # byte is handled with the ERR_CONT bit in this table.
+    #
     # The above explanation is slightly different in the case of AVX-512. There,
     # we only have two lookups, so we can't use the intermediate result from the
     # first and third nibble. Luckily, as described below, we organize the
     # tables to get the continuation bit for free on AVX-512 as well.
     ['MARK_CONT', [[0x8, 0xB], [0x0,  -1], [0x8, 0xB]]],
+
+    # ...and if that wasn't a complicated enough explanation, there is one more
+    # crazy trick here to take into account. One big problem with skipping the
+    # first continuation byte check is making sure that stray continuation bytes
+    # are found invalid (special thanks to @jkeiser on github for pointing this
+    # out, since I somehow forgot to consider it). It doesn't seem possible to
+    # fit the ASCII->CONT error (e.g. 0x20 0x80) cleanly into this table; there
+    # are no bits to spare, and we can't hide/overlap the relevant bits anywhere
+    # else here. But, there is a saving grace: the (v)pshufb instruction that we
+    # use to do these vector table lookups has a usually-annoying feature: if
+    # the high bit is set on an input byte, the output byte is set to zero. We
+    # normally need to mask with 0x0F to get around this. But due to a happy
+    # coincidence, we can use the (v)pandn instruction to flip the input bits
+    # before ANDing, and we can change the mask to 0x8F, just for the second
+    # nibble (we also need to reverse the lookup table for the second nibble to
+    # match the NOT). What this does is make ASCII input bytes get all zeroes
+    # for the second error lookup--but we want *more* errors for ASCII, not
+    # less. So we need to flip the output bits too--both in the lookup table
+    # values and in the result, which we get for free by changing another
+    # (v)pand to (v)pandn. Luckily, this lines up perfectly with the MARK_CONT
+    # bit: for this bit, the second nibble is normally never set (since the
+    # bit is just used as a marker), and the third nibble is only set for
+    # continuation bytes. With the high-bit lookup zeroing, though, the second
+    # nibble then becomes all ones with an ASCII input byte, making this bit
+    # actually trigger an error. We have more luck in that this is the only
+    # error with ASCII in the first nibble, so that this particular bit is the
+    # only bit that will be affected by the high-bit zeroing--without this
+    # trick, the first half of the first nibble table is all zeroes. So anyways,
+    # the point is that fixing the ASCII->cont. byte problem can be done almost
+    # for free: we need one extra register to hold the 0x8F constant, but we
+    # save a couple bytes in instruction encoding (vpandn is one byte shorter
+    # than vpand). For NEON, we don't get off quite so easily, since there's
+    # no AND NOT instruction. Shucks.
+    #
+    # We give a different name to this bit error (MARK_CONT2), but it overlaps
+    # with MARK_CONT for x86/NEON--they're the same bit. But, that won't work
+    # for AVX-512! One of the two 64-entry lookup tables can see the top two
+    # bits of each of two consecutive bytes, all in one index, so we can
+    # perfectly detect the ASCII->continuation byte case. But, we need this bit
+    # to either be set or not in the *other* table based on the first byte being
+    # ASCII or not. That is, MARK_CONT should never be set in the other table,
+    # but MARK_CONT2 always should be. So we need to pull out yet another trick
+    # for AVX-512, which is a simple one: we make MARK_CONT2 overlap with a
+    # different bit, ERR_CONT. This bit has the nice property that it's set for
+    # every value of the first index (which contains the low six bits of the
+    # first byte). MARK_CONT and MARK_CONT2 can thus be discriminated in the
+    # lookup tables, and trigger errors properly.
+    ['MARK_CONT2', [[0x0, 0x7], [0x0,  -1], [0x8, 0xB]]],
 ]
 
 # Bit maps: the different error bits are arranged differently for x86 and NEON
@@ -81,8 +134,17 @@ x86_bit_map = {
     'ERR_OVER3':  4,
     'ERR_MAX1':   5,
     'ERR_MAX2':   6,
-    'MARK_CONT':  7
+    'MARK_CONT':  7,
+    'MARK_CONT2': 7
 }
+
+# The AVX-512 bit mapping is almost identical, save for one difference: here,
+# the MARK_CONT2 bit overlaps with ERR_CONT instead of MARK_CONT. As described
+# above, we need a slightly different trick for AVX-512 since we aren't using
+# the same vpshufb/AND sequence.
+avx512_bit_map = x86_bit_map.copy()
+avx512_bit_map['MARK_CONT2'] = avx512_bit_map['ERR_CONT']
+
 # For NEON, we have a different constraint: we want to keep the continuation
 # byte marker in the low bit, for a rather arcane reason. We merge the
 # 3/4-byte markers with two instructions, after shifting the vector lanes
@@ -103,10 +165,11 @@ neon_bit_map = {
     'ERR_OVER3':  5,
     'ERR_MAX1':   6,
     'ERR_MAX2':   7,
-    'MARK_CONT':  0
+    'MARK_CONT':  0,
+    'MARK_CONT2': 0
 }
 
-def make_bit_tables(bit_map):
+def make_bit_tables(bit_map, flip_second_nibble=False):
     # Transform single values to [n, n] ranges, and remap bits
     errors = [[bit_map[bit], [[n, n] if isinstance(n, int) else n
         for n in nibbles]] for bit, nibbles in error_nibbles]
@@ -117,6 +180,13 @@ def make_bit_tables(bit_map):
         for n, (lo, hi) in enumerate(nibbles):
             for value in range(lo, hi+1):
                 error_bits[n][value] |= 1 << bit
+
+    # Flip the second nibble if requested, as described above--for all the
+    # architectures that use 16-byte lookups (i.e. everything but AVX-512), the
+    # input and output bits for the second nibble table are both flipped. So we
+    # need to reverse the order of the table values and invert them.
+    if flip_second_nibble:
+        error_bits[1] = [0xFF ^ entry for entry in error_bits[1][::-1]]
 
     return error_bits
 
@@ -229,9 +299,11 @@ def write_table(f, table, bit_map):
         f.write('#   define %-20s %s\n' % (k, v))
 
 def main(args):
-    x86_table = make_bit_tables(x86_bit_map)
-    avx512_table = make_64_bit_tables(x86_table, x86_bit_map)
-    neon_table = make_bit_tables(neon_bit_map)
+    x86_table = make_bit_tables(x86_bit_map, flip_second_nibble=True)
+    neon_table = make_bit_tables(neon_bit_map, flip_second_nibble=True)
+
+    avx512_table_16 = make_bit_tables(avx512_bit_map)
+    avx512_table = make_64_bit_tables(avx512_table_16, avx512_bit_map)
 
     # Write the output file
     output = open(args[1], 'w') if len(args) > 1 else sys.stdout

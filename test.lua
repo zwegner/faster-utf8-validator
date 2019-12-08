@@ -12,25 +12,6 @@ for i, opt in ipairs(arg) do
     end
 end
 
---
---function str(value)
---    local meta = getmetatable(value)
---    if type(value) == 'table' and (not meta or not meta['__tostring']) then
---        local s = ''
---        for k, v in pairs(value) do
---            s = s .. ('[%s] = %s, '):format(str(k), str(v))
---        end
---        return '{' .. s .. '}'
---    elseif type(value) == 'string' then
---        -- %q annoyingly replaces '\n' with '\\\n', that is, a backslash and
---        -- then an actual newline. Replace the newline with an 'n'.
---        return (('%q'):format(value):gsub('\n', 'n'))
---    else
---        return tostring(value)
---    end
---end
---print(str(opts))
-
 local skip = opts['--skip'] or 0
 
 -- Parse -b option, to build with make.py
@@ -38,7 +19,6 @@ local build = opts['-b']
 
 -- Parse arguments to see what arches/configuration we're testing
 local conf = opts['-d'] and 'deb' or 'rel'
-
 local arches
 if opts['--neon'] then
     arches = {'neon'}
@@ -88,10 +68,6 @@ local CONT = { 0x80, 0xBF }
 local TEST_CASES = {
     -- ASCII
     {  true, ASCII, ASCII, ASCII, ASCII },
---    { false, ASCII, CONT },
---    { false, ASCII, CONT, CONT },
---    { false, ASCII, CONT, CONT, CONT },
---    { false, ASCII, CONT, CONT, CONT, CONT },
 
     -- 2-byte sequences
     { false, { 0xC2, 0xDF }, },
@@ -117,6 +93,13 @@ local TEST_CASES = {
     { false, { 0xF1, 0xF3 }, CONT, CONT, ASCII },
     {  true, { 0xF1, 0xF3 }, CONT, CONT, CONT, ASCII },
     { false, { 0xF1, 0xF3 }, CONT, CONT, CONT, CONT },
+
+    -- Stray continuation bytes
+    { false, CONT },
+    { false, ASCII, CONT },
+    { false, ASCII, CONT, CONT },
+    { false, ASCII, CONT, CONT, CONT },
+    { false, ASCII, CONT, CONT, CONT, CONT },
 
     -- No C0/C1 bytes (overlong)
     { false, { 0xC0, 0xC1 }, ANY },
@@ -246,8 +229,8 @@ local TRAILING_TESTS = {
 
 for _, test in ipairs(TRAILING_TESTS) do
     local expected = table.remove(test, 1)
-    for pre = 6, 80 do
-        for post = 16, 80 do
+    for pre = 0, 80 do
+        for post = 0, 80 do
             local buffer = {}
             local len = pre + #test + post
             -- Fill in invalid bytes everywhere
