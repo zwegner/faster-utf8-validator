@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # faster-utf8-validator
 #
 # Copyright (c) 2019 Zach Wegner

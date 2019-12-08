@@ -1,4 +1,27 @@
 #!/usr/bin/env luajit
+
+-- faster-utf8-validator
+--
+-- Copyright (c) 2019 Zach Wegner
+-- 
+-- Permission is hereby granted, free of charge, to any person obtaining a copy
+-- of this software and associated documentation files (the "Software"), to deal
+-- in the Software without restriction, including without limitation the rights
+-- to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-- copies of the Software, and to permit persons to whom the Software is
+-- furnished to do so, subject to the following conditions:
+-- 
+-- The above copyright notice and this permission notice shall be included in
+-- all copies or substantial portions of the Software.
+-- 
+-- THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-- IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-- FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-- AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-- LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-- OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+-- SOFTWARE.
+
 local ffi = require('ffi')
 
 -- Parse options
@@ -78,12 +101,13 @@ local TEST_CASES = {
     { false, { 0xC2, 0xDF }, CONT, CONT, CONT },
 
     -- 3-byte sequences
-    { false, { 0xE1, 0xE1 }, },
-    { false, { 0xE1, 0xE1 }, CONT },
-    {  true, { 0xE1, 0xE1 }, CONT, CONT },
-    {  true, { 0xE1, 0xE1 }, CONT, CONT, ASCII },
-    { false, { 0xE1, 0xE1 }, CONT, ASCII },
-    { false, { 0xE1, 0xE1 }, CONT, CONT, CONT },
+    { false, { 0xE1, 0xEC }, },
+    { false, { 0xE1, 0xEC }, CONT },
+    {  true, { 0xE1, 0xEC }, CONT, CONT },
+    {  true, { 0xE1, 0xEC }, CONT, CONT, ASCII },
+    {  true, { 0xEE, 0xEF }, CONT, CONT },
+    { false, { 0xE1, 0xEC }, CONT, ASCII },
+    { false, { 0xE1, 0xEC }, CONT, CONT, CONT },
 
     -- 4-byte sequences
     { false, { 0xF1, 0xF3 }, },
@@ -95,7 +119,7 @@ local TEST_CASES = {
     { false, { 0xF1, 0xF3 }, CONT, CONT, CONT, CONT },
 
     -- Stray continuation bytes
-    { false, CONT },
+    { false, CONT, ANY },
     { false, ASCII, CONT },
     { false, ASCII, CONT, CONT },
     { false, ASCII, CONT, CONT, CONT },
@@ -130,9 +154,26 @@ local TEST_CASES = {
     { false, { 0xF5, 0xFF }, ANY, ANY, ANY },
 
     -- No consecutive leader bytes
-    { false, { 0xC0, 0xF4 }, { 0xC0, 0xF4 }, CONT },
-    { false, { 0xC0, 0xF4 }, { 0xC0, 0xF4 }, CONT, CONT },
-    { false, { 0xC0, 0xF4 }, { 0xC0, 0xF4 }, CONT, CONT, CONT },
+    { false, { 0xC0, 0xFF }, { 0xC0, 0xFF }, CONT },
+    { false, { 0xC0, 0xFF }, { 0xC0, 0xFF }, CONT, CONT },
+    { false, { 0xC0, 0xFF }, { 0xC0, 0xFF }, CONT, CONT, CONT },
+
+    -- Various other cases that probably won't fail, but are here to check that
+    -- we at least check every permutation of two bytes in a row.
+    { false, ASCII, { 0xC0, 0xC1 }, CONT },
+    {  true, ASCII, { 0xC2, 0xDF }, CONT },
+    { false, ASCII, { 0xE0, 0xE0 }, { 0x00, 0x9F }, CONT },
+    {  true, ASCII, { 0xE0, 0xE0 }, { 0xA0, 0xBF }, CONT },
+    {  true, ASCII, { 0xE1, 0xEC }, CONT, CONT },
+    {  true, ASCII, { 0xED, 0xED }, { 0x80, 0x9F }, CONT },
+    { false, ASCII, { 0xED, 0xED }, { 0xA0, 0xBF }, CONT },
+    {  true, ASCII, { 0xEE, 0xEF }, CONT, CONT },
+    { false, ASCII, { 0xF0, 0xF0 }, { 0x80, 0x8F }, CONT, CONT },
+    {  true, ASCII, { 0xF0, 0xF0 }, { 0x90, 0xBF }, CONT, CONT },
+    {  true, ASCII, { 0xF1, 0xF3 }, CONT, CONT, CONT },
+    {  true, ASCII, { 0xF4, 0xF4 }, { 0x80, 0x8F }, CONT, CONT },
+    { false, ASCII, { 0xF5, 0xFF }, CONT, CONT, CONT },
+    { false, { 0xC0, 0xFF }, ASCII },
 }
 
 -- Array string
@@ -164,14 +205,20 @@ function test_validators(str, len, buffer, expected, count, fails)
     return count, fails
 end
 
+local seen = ffi.new('char [256][256]')
+
+for i = 0, 255 do
+    for j = 0, 255 do
+        assert(seen[i][j] == 0)
+    end
+end
+
 local count, fails = 0, 0
 for idx, test in ipairs(TEST_CASES) do
     local expected = table.remove(test, 1)
     local lo_1, hi_1 = unpack(table.remove(test, 1))
     -- Loop through various frame shifts, to make sure we catch any issues due
     -- to vector alignment
-    --for _, k in ipairs{60, 61, 62, 63, 64, 65} do
-    --for _, k in ipairs{1, 10, 28, 29, 20, 31, 32, 33, 60, 61, 62, 63, 64, 65} do
     for k = 1, 70 do
         local buffer = {}
         for j = 1, 256 do buffer[j] = 0 end
@@ -200,6 +247,8 @@ for idx, test in ipairs(TEST_CASES) do
                     break
                 end
 
+                seen[buffer[1]][buffer[2]] = true
+
                 -- Run the validators
                 local str = ffi.string(string.char(unpack(buffer)), #buffer)
                 count, fails = test_validators(str, #buffer, buffer, expected,
@@ -209,6 +258,12 @@ for idx, test in ipairs(TEST_CASES) do
 
         -- Make sure we're running tests
         assert(count > last_count)
+    end
+end
+
+for i = 0, 255 do
+    for j = 0, 255 do
+        assert(seen[i][j] == 1, ('fail at [%2X][%2X]'):format(i, j))
     end
 end
 

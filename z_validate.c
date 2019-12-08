@@ -139,14 +139,15 @@
 #define DEBUG(x)            //x
 
 #if defined(ASCII_CHECK)
-#   define ASCII            _ascii
+#   define ASCII_SUFFIX     _ascii
 #else
-#   define ASCII
+#   define ASCII_SUFFIX
 #endif
 
+// Dumb C preprocessor nonsense to get customized symbols from the configuration
 #define NAME_(name, suff, ascii)    name##_##suff##ascii
 #define NAME__(name, suff, ascii)   NAME_(name, suff, ascii)
-#define NAME(name)                  NAME__(name, SUFFIX, ASCII)
+#define NAME(name)                  NAME__(name, SUFFIX, ASCII_SUFFIX)
 
 #if defined(AVX2)
 
@@ -165,9 +166,6 @@
 #   define vmask_t          uint32_t
 #   define vmask2_t         uint64_t
 
-//#   define v_load(x)        _mm256_maskload_epi32((int *)(x), v_set1(0x80))
-//#   define v_load(x)        _mm256_loadu_si256((vec_t *)(x))
-//#   define v_loadu(x)        _mm256_loadu_si256((vec_t *)(x))
 #   define v_load(x)        _mm256_load_si256((vec_t *)(x))
 #   define v_loadu(x)       _mm256_lddqu_si256((vec_t *)(x))
 #   define v_set1           _mm256_set1_epi8
@@ -201,7 +199,10 @@
 //      top half: input_L:input_H --> input_L[15]:input_H[0:14]
 //   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
 
-static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
+        const uint32_t n) {
+    // XXX can't use a shift from a variable at all, even when this is inlined
+    // as a constant
     (void)n;
     //assert(n == 1, "unsupported lane shift");
     vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
@@ -257,7 +258,8 @@ typedef struct {
 #   define _mm512_setr_epi8(...) \
         (__extension__ (__m512i)(__v64qi) { __VA_ARGS__ } )
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
+        const uint32_t n) {
 }
 
 // Load from the "data" pointer, but shifted one byte forward. We want to do
@@ -307,7 +309,8 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 
 #   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
-static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
+        const uint32_t n) {
     (void)n;
     return _mm_alignr_epi8(top, bottom, 16 - 1);
 }
@@ -351,7 +354,8 @@ static inline uint64_t NAME(_v_test_any)(vec_t vec) {
 
 #   define V_TABLE_16(...)  ( (uint8x16_t) { __VA_ARGS__ } )
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
+        const uint32_t n) {
     return vextq_u8(bottom, top, 16 - n);
 }
 
@@ -382,7 +386,8 @@ typedef struct {
 #   define vmask_or(a, b)       ((a) | (b))
 #   define test_carry_req(r)    ((r) != 0)
 #   define result_fails(r)                                                  \
-            (UNLIKELY((r).cont_error != 0) || UNLIKELY(v_test_any((r).lookup_error)))
+            (UNLIKELY((r).cont_error != 0) ||                               \
+             UNLIKELY(v_test_any((r).lookup_error)))
 #else
 #   define vmask_or         v_or
 // In the NEON code paths, we keep continuation byte masks as vectors, and need
@@ -399,13 +404,13 @@ typedef struct {
 // just hoisting out an AND from the unrolled loop that the compiler can't
 // really be trusted to do itself.
 #   define result_fails(r)                                                  \
-            (v_test_any(v_and((r).cont_error, v_set1(1 << MARK_CONT))) ||   \
-             v_test_any((r).lookup_error))
+            (UNLIKELY(v_test_bit((r).cont_error, MARK_CONT)) ||             \
+             UNLIKELY(v_test_any((r).lookup_error)))
 #endif
 
 #define USE_UNALIGNED_LOADS
 //#define USE_NEXT_LOAD
-#define UNROLL_COUNT    (4)
+#define UNROLL_COUNT    (6)
 #define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
 #define state_t     NAME(_state_t)
@@ -518,7 +523,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // won't be checked.
     vec_t e_1_3 = v_and(e_1, e_3);
 
-    // Create the result vector with any bits are set in all three error masks.
+    // Create the result vector with any bits set in all three error masks.
     // Note that we use AND NOT here, because the bits in e_2 are inverted--
     // this is needed for ASCII->continuation to trigger the MARK_CONT2 error.
     result.lookup_error = v_andn(e_2, e_1_3);
@@ -554,6 +559,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // and shift it forward by 1, 2, or 3. This loop should be unrolled by
     // the compiler, and the (n == 1) branch inside eliminated.
     vmask_t leader_3 = v_test_bit(e_1, ERR_SURR);
+    // Micro-optimization: use x+x instead of x<<1, it's a tiny bit faster
     vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), ERR_MAX2 + 1);
 
     // We add the shifted mask here instead of ORing it, which would
@@ -639,8 +645,8 @@ static inline int NAME(z_validate_unrolled_chunk)(state_t *state, const char *da
 // of the data). This is so the transient state such as the carry_req mask works
 // consistently across the entire input--it can be thought of like padding the
 // input data with NUL bytes on either side.
-static inline int NAME(z_validate_small_chunk)(state_t *state, const char *data, size_t len,
-        char first, int align_at_start) {
+static inline int NAME(z_validate_small_chunk)(state_t *state, const char *data,
+        size_t len, char first, int align_at_start) {
     // Deal with any bytes remaining. Rather than making a separate scalar path,
     // just fill in a buffer, reading bytes only up to len, and load from that.
     char ALIGNED(V_LEN) buffer[V_LEN + 1] = { 0 };
@@ -673,8 +679,9 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         if (NAME(z_validate_small_chunk)(state, data, len, '\0', 0))
             return 0;
     } else {
-        // Validate the start section
-        if (NAME(z_validate_small_chunk)(state, data, aligned_data - data, '\0', 0))
+        // Validate the start section between data and aligned_data
+        if (NAME(z_validate_small_chunk)(state, data, aligned_data - data,
+                '\0', 0))
             return 0;
 
         // Get the size of the aligned inner section of data
@@ -683,14 +690,14 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // don't fill an entire UNROLL_SIZE-byte chunk
         aligned_len = aligned_len - (aligned_len % UNROLL_SIZE);
 
-        // Validate the main inner section of the input, in UNROLL_SIZE-byte chunks
+        // Validate the main inner part of the input, in UNROLL_SIZE-byte chunks
         for (size_t offset = 0; offset < aligned_len; offset += UNROLL_SIZE) {
             if (NAME(z_validate_unrolled_chunk)(state, aligned_data + offset))
                 return 0;
         }
 
-        // Validate the end section. This might be multiple vector's worth of data,
-        // due to the main loop being unrolled
+        // Validate the end section. This might be multiple vector's worth of
+        // data, due to the main loop being unrolled
         const char *end_data = aligned_data + aligned_len;
         size_t end_len = (data + len) - end_data;
         for (size_t offset = 0; offset < end_len; offset += V_LEN) {
@@ -702,12 +709,11 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         }
     }
 
-    // Micro-optimization compensation! We have to double check
-    // for a multi-byte sequence that starts on the last byte, since we
-    // check for the first continuation byte using error masks,
-    // which are shifted one byte forward in the data stream. Thus, a leader
-    // byte in the last position will be ignored if it's also the last byte
-    // of a vector.
+    // Micro-optimization compensation! We have to double check for a multi-byte
+    // sequence that starts on the last byte, since we check for the first
+    // continuation byte using error masks, which are shifted one byte forward
+    // in the data stream. Thus, a leader byte in the last position will be
+    // ignored if it's also the last byte of a vector.
     if (len > 0 && (uint8_t)data[len - 1] >= 0xC0)
         return 0;
 
