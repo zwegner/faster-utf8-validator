@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # faster-utf8-validator
 #
 # Copyright (c) 2019 Zach Wegner
@@ -24,9 +25,12 @@ import sys
 
 error_nibbles = [
     # First continuation byte errors. Any byte following 0xCx..0xFx must be
-    # in the range 0x80..0xBF
+    # in the range 0x80..0xBF, and any byte following an ASCII byte must *not*
+    # be in the range 0x80..0xBF
     ['ERR_CONT',  [[0xC, 0xF], [0x0, 0xF], [0x0, 0x7]]],
     ['ERR_CONT',  [[0xC, 0xF], [0x0, 0xF], [0xC, 0xF]]],
+
+    #['ERR_SURR',  [[0x0, 0x7], [0x0, 0xF], [0x8, 0xB]]],
 
     ['ERR_OVER1', [ 0xC,       [0x0, 0x1], [0x0, 0xF]]],
     ['ERR_OVER2', [ 0xE,        0x0,       [0x8, 0x9]]],
@@ -218,19 +222,20 @@ def write_table(f, table, bit_map):
                 (n+1, t_len, t))
     # Add #defines for the names of the various bits. This is actually a lot
     # uglier than it seems: we'd really want to use an enum, but this generated
-    # table.h is included locally
+    # table.h is included locally inside our validation function. 
     for k in sorted(bit_map):
         f.write('#   undef %s\n' % k)
     for k, v in sorted(bit_map.items()):
         f.write('#   define %-20s %s\n' % (k, v))
 
-def main(path):
+def main(args):
     x86_table = make_bit_tables(x86_bit_map)
     avx512_table = make_64_bit_tables(x86_table, x86_bit_map)
     neon_table = make_bit_tables(neon_bit_map)
 
     # Write the output file
-    with open(path, 'w') as f:
+    output = open(args[1], 'w') if len(args) > 1 else sys.stdout
+    with output as f:
         f.write('#if defined(AVX512_VBMI)\n')
         write_table(f, avx512_table, x86_bit_map)
         f.write('#elif defined(NEON)\n')
@@ -240,4 +245,4 @@ def main(path):
         f.write('#endif\n')
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    main(sys.argv)

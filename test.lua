@@ -1,21 +1,73 @@
+#!/usr/bin/env luajit
 local ffi = require('ffi')
 
--- Parse arguments to see what arches we're testing
+-- Parse options
+local opts = {}
+for i, opt in ipairs(arg) do
+    if opt == '--skip' then
+        opts[opt] = tonumber(arg[i + 1])
+        table.remove(arg, i + 1)
+    else
+        opts[opt] = i
+    end
+end
+
+--
+--function str(value)
+--    local meta = getmetatable(value)
+--    if type(value) == 'table' and (not meta or not meta['__tostring']) then
+--        local s = ''
+--        for k, v in pairs(value) do
+--            s = s .. ('[%s] = %s, '):format(str(k), str(v))
+--        end
+--        return '{' .. s .. '}'
+--    elseif type(value) == 'string' then
+--        -- %q annoyingly replaces '\n' with '\\\n', that is, a backslash and
+--        -- then an actual newline. Replace the newline with an 'n'.
+--        return (('%q'):format(value):gsub('\n', 'n'))
+--    else
+--        return tostring(value)
+--    end
+--end
+--print(str(opts))
+
+local skip = opts['--skip'] or 0
+
+-- Parse -b option, to build with make.py
+local build = opts['-b']
+
+-- Parse arguments to see what arches/configuration we're testing
+local conf = opts['-d'] and 'deb' or 'rel'
+
 local arches
-if arg[1] == 'neon' then
+if opts['--neon'] then
     arches = {'neon'}
 else
     arches = {'avx2', 'sse4'}
-    if arg[1] == 'avx512' then
+    if opts['--avx512'] then
         table.insert(arches, 'avx512_vbmi')
     end
+end
+
+-- Get paths of requested libraries, so we can build if requested
+local cmd = 'make.py'
+local lib_paths = {}
+for _, arch in ipairs(arches) do
+    local path = '_out/'..arch..'/'..conf..'/zval.so'
+    lib_paths[arch] = path
+    cmd = cmd .. ' ' .. path
+end
+
+if build then
+    ffi.cdef('int system(const char *command);')
+    ffi.C.system(cmd)
 end
 
 -- Load libraries and create a table of all validator functions we're testing
 local libs = {}
 local VALIDATORS = {}
 for _, arch in ipairs(arches) do
-    local lib = ffi.load('_out/'..arch..'/rel/zval.so')
+    local lib = ffi.load(lib_paths[arch])
     -- XXX keep a reference to the library, apparently the function reference
     -- below isn't enough for luajit to keep the library from being gc'ed
     table.insert(libs, lib)
@@ -36,6 +88,10 @@ local CONT = { 0x80, 0xBF }
 local TEST_CASES = {
     -- ASCII
     {  true, ASCII, ASCII, ASCII, ASCII },
+--    { false, ASCII, CONT },
+--    { false, ASCII, CONT, CONT },
+--    { false, ASCII, CONT, CONT, CONT },
+--    { false, ASCII, CONT, CONT, CONT, CONT },
 
     -- 2-byte sequences
     { false, { 0xC2, 0xDF }, },
@@ -109,9 +165,15 @@ end
 function test_validators(str, len, buffer, expected, count, fails)
     for name, validate in pairs(VALIDATORS) do
         local result = validate(str, len)
+        --local result = expected
+        --if count >= skip then
+        --    result = validate(str, len)
+        --end
         if result ~= expected then
             fails = fails + 1
-            print('failure:', name, result, expected, astr(buffer))
+            print(('failure on test %s, arch %s: got %s, expected %s'):format(
+                    count, name, result, expected))
+            print(astr(buffer))
             assert(false)
         end
         count = count + 1
@@ -184,8 +246,8 @@ local TRAILING_TESTS = {
 
 for _, test in ipairs(TRAILING_TESTS) do
     local expected = table.remove(test, 1)
-    for pre = 0, 80 do
-        for post = 0, 80 do
+    for pre = 6, 80 do
+        for post = 16, 80 do
             local buffer = {}
             local len = pre + #test + post
             -- Fill in invalid bytes everywhere

@@ -134,6 +134,8 @@
 
 #define UNUSED              __attribute__((unused))
 
+#define ALIGNED(x)          __attribute__((aligned(x)))
+
 #define DEBUG(x)            //x
 
 #if defined(ASCII_CHECK)
@@ -198,14 +200,14 @@
 //      top half: input_L:input_H --> input_L[15]:input_H[0:14]
 //   bottom half:  zero_H:input_L -->  zero_H[15]:input_L[0:14]
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
     (void)n;
     //assert(n == 1, "unsupported lane shift");
     vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
     return _mm256_alignr_epi8(top, shl_16, 16 - 1);
 }
 
-static inline vec_t NAME(v_load_shift_first)(const char *data) {
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data) {
     return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
 }
 
@@ -304,12 +306,12 @@ static inline vec_t NAME(v_load_shift_first)(const char *data) {
 
 #   define V_TABLE_16(...)  _mm_setr_epi8(__VA_ARGS__)
 
-static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
+static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top, const uint32_t n) {
     (void)n;
     return _mm_alignr_epi8(top, bottom, 16 - 1);
 }
 
-static inline vec_t NAME(v_load_shift_first)(const char *data) {
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data) {
     return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
 }
 
@@ -383,7 +385,7 @@ typedef struct {
 #   define vmask_or(a, b)       ((a) | (b))
 #   define test_carry_req(r)    ((r) != 0)
 #   define result_fails(r)                                                  \
-            ((r).cont_error != 0 || v_test_any((r).lookup_error))
+            (UNLIKELY((r).cont_error != 0) || UNLIKELY(v_test_any((r).lookup_error)))
 #else
 #   define vmask_or         v_or
 // In the NEON code paths, we keep continuation byte masks as vectors, and need
@@ -405,8 +407,8 @@ typedef struct {
 #endif
 
 #define USE_UNALIGNED_LOADS
-#define USE_NEXT_LOAD
-#define UNROLL_COUNT    (6)
+//#define USE_NEXT_LOAD
+#define UNROLL_COUNT    (4)
 #define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
 #define state_t     NAME(_state_t)
@@ -418,15 +420,16 @@ typedef struct {
 #elif !defined(USE_UNALIGNED_LOADS)
     vec_t last_bytes;
 #endif
+    // Keep continuation bits from the previous iteration that carry over to
+    // each input chunk vector
+    vmask_t carry_req;
 } state_t;
 
-static inline void NAME(load_first)(state_t *state, const char *data) {
-#if defined(USE_NEXT_LOAD)
-    state->bytes = v_set1(0);
-    state->next_shifted_bytes = NAME(v_load_shift_first)(data);
+static inline void NAME(init_state)(state_t *state) {
+#if defined(NEON)
+    state->carry_req = v_set1(0);
 #else
-    state->bytes = v_load(data);
-    state->shifted_bytes = NAME(v_load_shift_first)(data);
+    state->carry_req = 0;
 #endif
 }
 
@@ -436,8 +439,8 @@ static inline void NAME(load_next)(state_t *state, const char *data) {
     state->shifted_bytes = state->next_shifted_bytes;
     state->next_shifted_bytes = v_loadu(data + V_LEN - 1);
 #elif defined(USE_UNALIGNED_LOADS)
-    state->bytes = v_load(data);
     state->shifted_bytes = v_loadu(data - 1);
+    state->bytes = v_load(data);
 #else
     state->last_bytes = state->bytes;
     state->bytes = v_load(data);
@@ -581,115 +584,120 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     return result;
 }
 
+// Validate a chunk of input data which is <UNROLL_COUNT> consecutive vectors.
+// This assumes that <data> is aligned to a V_LEN boundary, and that we can read
+// one byte before data. We only check for validation failures or ASCII-only
+// input once in this function, for entire input chunks.
+static inline int NAME(z_validate_unrolled_chunk)(state_t *state, const char *data) {
+#if defined(ASCII_CHECK)
+    // Quick skip for ASCII-only input. If there are no bytes with the
+    // high bit set, we can skip this chunk. If we expected any
+    // continuation bytes here, we return invalid, otherwise just skip.
+    vec_t ascii_vec = v_load(data);
+    for (uint32_t i = 1; i < UNROLL_COUNT; i++)
+        ascii_vec = v_or(ascii_vec, v_load(data + i * V_LEN));
+
+    if (LIKELY(!v_test_bit(ascii_vec, 7))) {
+        if (test_carry_req(state->carry_req))
+            return 1;
+
+        // Set up the state for the next iteration by loading the last
+        // vector. This is rather ugly...
+        NAME(load_next)(state, data + (UNROLL_COUNT - 1) * V_LEN);
+        return 0;
+    }
+#endif
+
+    // Run other validations. Annoyingly, at least one compiler (GCC 8)
+    // doesn't optimize v_or(0, x) into x, so manually unroll the first
+    // iteration
+    NAME(load_next)(state, data + 0 * V_LEN);
+    result_t result = NAME(z_validate_vec)(state->bytes,
+            state->shifted_bytes, &state->carry_req);
+    for (uint32_t i = 1; i < UNROLL_COUNT; i++) {
+        NAME(load_next)(state, data + i * V_LEN);
+        result_t r = NAME(z_validate_vec)(state->bytes,
+                state->shifted_bytes, &state->carry_req);
+
+        result.lookup_error = v_or(result.lookup_error, r.lookup_error);
+        result.cont_error = vmask_or(result.cont_error, r.cont_error);
+    }
+
+    return result_fails(result);
+}
+
+// Validate a piece of data too small to fit in a full unrolled chunk. This is
+// done at the beginning and end of the input, and is slower because we copy
+// input data into a buffer--we need to copy because memory outside the input
+// might be unmapped and cause a segfault. This function takes two nontrivial
+// parameters: <first> is the character before the input data pointer (which is
+// handled specially outside of this code), and <align_at_start>, which decides
+// which side of the buffer to align the input data on (the end of the buffer
+// for the first part of the data, or the start of the buffer for the last part
+// of the data). This is so the transient state such as the carry_req mask works
+// consistently across the entire input--it can be thought of like padding the
+// input data with NUL bytes on either side.
+static inline int NAME(z_validate_small_chunk)(state_t *state, const char *data, size_t len,
+        char first, int align_at_start) {
+    // Deal with any bytes remaining. Rather than making a separate scalar path,
+    // just fill in a buffer, reading bytes only up to len, and load from that.
+    char ALIGNED(V_LEN) buffer[V_LEN + 1] = { 0 };
+    size_t offset = align_at_start ? 0 : V_LEN - len;
+    buffer[offset] = first;
+    assert(len <= V_LEN);
+    for (size_t i = 0; i < len; i++)
+        buffer[offset + i + 1] = data[i];
+
+    vec_t bytes = v_loadu(buffer + 1);
+    vec_t shifted_bytes = v_load(buffer);
+    result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
+            &state->carry_req);
+    return result_fails(result);
+}
+
 int NAME(z_validate_utf8)(const char *data, size_t len) {
-    //const char *aligned_data;
-    //size_t aligned_len;
-    size_t offset = 0;
+    state_t state[1];
+    NAME(init_state)(state);
 
     // Get an aligned pointer to our input data. We round up to the next
     // multiple of V_LEN after data + 1, since we need to read one byte before
     // the data pointer for shifted_bytes. This rounding is equivalent to
     // rounding down after adding V_LEN, which is what this does, by clearing
     // the low bits of the pointer (V_LEN is always a power of two).
-    //aligned_data = (const char *)(((intptr_t)data + V_LEN) & -V_LEN);
+    const char *aligned_data = (const char *)(((intptr_t)data + V_LEN) & -V_LEN);
 
-    // Keep continuation bits from the previous iteration that carry over to
-    // each input chunk vector
-    vmask_t carry_req = 0;//v_set1(0);
-
-    // Deal with the input up until the last section of bytes
-    if (len >= V_LEN) {
-        // We need a vector of the input byte stream shifted forward one byte.
-        // Since we don't want to read the memory before the data pointer
-        // (which might not even be mapped), for the first chunk of input just
-        // use vector instructions.
-        state_t state[1];
-        NAME(load_first)(state, data);
-
-#if !defined(USE_NEXT_LOAD)
-        result_t result = NAME(z_validate_vec)(state->bytes,
-                state->shifted_bytes, &carry_req);
-        offset += V_LEN;
-        if (UNLIKELY(result_fails(result)))
+    if (aligned_data >= data + len) {
+        // The input wasn't big enough to fill one vector
+        if (NAME(z_validate_small_chunk)(state, data, len, '\0', 0))
             return 0;
-#endif
+    } else {
+        // Validate the start section
+        if (NAME(z_validate_small_chunk)(state, data, aligned_data - data, '\0', 0))
+            return 0;
 
-        for (; offset + UNROLL_SIZE
-#if defined(USE_NEXT_LOAD)
-        + V_LEN - 1
-#endif
-                < len; offset += UNROLL_SIZE) {
-#if defined(ASCII_CHECK)
-            // Quick skip for ASCII-only input. If there are no bytes with the
-            // high bit set, we can skip this chunk. If we expected any
-            // continuation bytes here, we return invalid, otherwise just skip.
-            vec_t ascii_vec = v_load(data + offset);
-            for (uint32_t i = 1; i < UNROLL_COUNT; i++)
-                ascii_vec = v_or(ascii_vec, v_load(data + offset + i * V_LEN));
+        // Get the size of the aligned inner section of data
+        size_t aligned_len = len - (aligned_data - data);
+        // Subtract from the aligned_len any bytes at the end of the input that
+        // don't fill an entire UNROLL_SIZE-byte chunk
+        aligned_len = aligned_len - (aligned_len % UNROLL_SIZE);
 
-            if (LIKELY(!v_test_bit(ascii_vec, 7))) {
-                if (test_carry_req(carry_req))
-                    return 0;
-
-                // Set up the state for the next iteration by loading the last
-                NAME(load_next)(state, data + offset + (UNROLL_COUNT-1) * V_LEN);
-                continue;
-            }
-#endif
-
-            // Run other validations. Annoyingly, at least one compiler (GCC 8)
-            // doesn't optimize v_or(0, x) into x, so manually unroll the first
-            // iteration
-            NAME(load_next)(state, data + offset + 0 * V_LEN);
-            result_t result = NAME(z_validate_vec)(state->bytes,
-                    state->shifted_bytes, &carry_req);
-            for (uint32_t i = 1; i < UNROLL_COUNT; i++) {
-                NAME(load_next)(state, data + offset + i * V_LEN);
-                result_t r = NAME(z_validate_vec)(state->bytes,
-                        state->shifted_bytes, &carry_req);
-
-                result.lookup_error = v_or(result.lookup_error, r.lookup_error);
-                result.cont_error = vmask_or(result.cont_error, r.cont_error);
-            }
-
-            if (UNLIKELY(result_fails(result)))
+        // Validate the main inner section of the input, in UNROLL_SIZE-byte chunks
+        for (size_t offset = 0; offset < aligned_len; offset += UNROLL_SIZE) {
+            if (NAME(z_validate_unrolled_chunk)(state, aligned_data + offset))
                 return 0;
         }
 
-#if defined(USE_NEXT_LOAD)
-        NAME(load_next)(state, data + offset);
-        result_t result = NAME(z_validate_vec)(state->bytes,
-                state->shifted_bytes, &carry_req);
-        offset += V_LEN;
-        if (UNLIKELY(result_fails(result)))
-            return 0;
-#endif
-
-        // Loop over input in V_LEN-byte chunks, as long as we can safely read
-        // that far into memory
-        for (; offset + V_LEN < len; offset += V_LEN) {
-            NAME(load_next)(state, data + offset);
-            result_t result = NAME(z_validate_vec)(state->bytes,
-                    state->shifted_bytes, &carry_req);
-            if (UNLIKELY(result_fails(result)))
+        // Validate the end section. This might be multiple vector's worth of data,
+        // due to the main loop being unrolled
+        const char *end_data = aligned_data + aligned_len;
+        size_t end_len = (data + len) - end_data;
+        for (size_t offset = 0; offset < end_len; offset += V_LEN) {
+            size_t l = end_len - offset;
+            l = l > V_LEN ? V_LEN : l;
+            if (NAME(z_validate_small_chunk)(state, end_data + offset, l,
+                        end_data[offset - 1], 1))
                 return 0;
         }
-    }
-    // Deal with any bytes remaining. Rather than making a separate scalar path,
-    // just fill in a buffer, reading bytes only up to len, and load from that.
-    if (offset < len) {
-        char buffer[V_LEN + 1] = { 0 };
-        if (offset > 0)
-            buffer[0] = data[offset - 1];
-        for (int i = 0; i < (int)(len - offset); i++)
-            buffer[i + 1] = data[offset + i];
-
-        vec_t bytes = v_loadu(buffer + 1);
-        vec_t shifted_bytes = v_loadu(buffer);
-        result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
-                &carry_req);
-        if (UNLIKELY(result_fails(result)))
-            return 0;
     }
 
     // Micro-optimization compensation! We have to double check
@@ -702,7 +710,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         return 0;
 
     // The input is valid if we don't have any more expected continuation bytes
-    return !test_carry_req(carry_req);
+    return !test_carry_req(state->carry_req);
 }
 
 // Undefine all macros
