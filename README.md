@@ -58,3 +58,19 @@ rows are this library, using AVX2 and SSE4 instruction sets.
 | `z_validate_utf8_avx2_ascii`          |    0.1706 |    0.0356 |    0.2162 |    0.1208 |
 | `z_validate_utf8_sse4`                |    0.3345 |    0.3348 |    0.3432 |    0.3434 |
 | `z_validate_utf8_sse4_ascii`          |    0.3496 |    0.0672 |    0.3582 |    0.1554 |
+
+
+| Validator                             | 64K UTF-8 | 64K ASCII | 16M UTF-8 | 16M ASCII |
+| ------------------------------------- | --------- | --------- | --------- | --------- |
+| `validate_utf8_fast_avx`              |    0.3475 |    0.3469 |    0.3587 |    0.3584 |
+| `validate_utf8_fast_avx_asciipath`    |    0.3413 |    0.0613 |    0.3845 |    0.1400 |
+| `validate_utf8_fast_avx512`           |    0.2376 |    0.2368 |    0.2678 |    0.2728 |
+| `validate_utf8_fast_avx512_asciipath` |    0.2452 |    0.0318 |    0.2726 |    0.1184 |
+| `z_validate_utf8_avx512_vbmi`         |    0.0768 |    0.0767 |    0.1425 |    0.1418 |
+| `z_validate_utf8_avx512_vbmi_ascii`   |    0.0845 |    0.0217 |    0.1439 |    0.1050 |
+| `z_validate_utf8_avx2`                |    0.1531 |    0.1534 |    0.1980 |    0.1978 |
+| `z_validate_utf8_avx2_ascii`          |    0.1726 |    0.0304 |    0.2066 |    0.1158 |
+| `z_validate_utf8_sse4`                |    0.3382 |    0.3268 |    0.3377 |    0.3369 |
+| `z_validate_utf8_sse4_ascii`          |    0.3673 |    0.0517 |    0.3623 |    0.1229 |
+
+

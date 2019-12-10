@@ -248,7 +248,8 @@ def make_64_bit_tables(bit_map):
 
     # We compute the 64-entry tables in a dumber brute force sort of way. This
     # is mainly because there are weird dependencies between the nibbles, like
-    # with MARK_CONT/MARK_CONT2/ERR_CONT. So we just loop over
+    # with MARK_CONT/MARK_CONT2/ERR_CONT. So we just loop over all the illegal
+    # nibble combinations, and set the relevant bit in the final tables.
     error_bits_64 = [[0] * 64 for i in range(2)]
     for bit, nibbles in errors:
         [[l_1, h_1], [l_2, h_2], [l_3, h_3]] = nibbles
