@@ -191,14 +191,14 @@ def make_bit_tables(bit_map, flip_second_nibble=False):
 
     return error_bits
 
-# Compute the two 64-entry lookup tables for AVX-512 by merging the three
-# 16-entry tables. We are looking up 12 bits total, which can be done with two
-# vpermb's on AVX-512. Instead of splitting the 12 bits down the middle, which
-# is perhaps the more obvious approach, we combine the first two and last four
-# bits of the 12 contiguous bits for the first index, and the remaining bits
-# for the second index. This is illustrated below:
+# Compute the two 64-entry lookup tables for AVX-512. We are looking up 12 bits
+# total, which can be done with two vpermb's on AVX-512. Instead of splitting
+# the 12 bits down the middle, which is perhaps the more obvious approach, we
+# combine the first two and last four bits of the 12 contiguous bits for the
+# first index, and the remaining bits for the second index. This is illustrated
+# below:
 #
-#   nibble:         1111 2222 3333
+#   nibble:         1--- 2--- 3---
 #   index 16:       xxxx yyyy zzzz
 #   bad index 64:   xxxx xxyy yyyy
 #   good index 64:  xxyy yyyy xxxx
@@ -242,42 +242,28 @@ def make_bit_tables(bit_map, flip_second_nibble=False):
 # use the same 0xF0 constant for finding 4-byte leader bytes and for the ternary
 # logic instruction. So, a very tiny difference either way, but that's the kind
 # of crazy stuff that matters for super-optimized code...
-def make_64_bit_tables(error_bits, bit_map):
+def make_64_bit_tables(bit_map):
+    errors = [[bit_map[bit], [[n, n] if isinstance(n, int) else n
+        for n in nibbles]] for bit, nibbles in error_nibbles]
+
+    # We compute the 64-entry tables in a dumber brute force sort of way. This
+    # is mainly because there are weird dependencies between the nibbles, like
+    # with MARK_CONT/MARK_CONT2/ERR_CONT. So we just loop over
     error_bits_64 = [[0] * 64 for i in range(2)]
-    for n in range(64):
-        n_1 = n_2 = 0
-        for x in range(4):
-            n_1 |= error_bits[0][(n >> 4) | (x << 2)] & error_bits[1][n & 0xF]
-            n_2 |= error_bits[2][n & 0xF] & error_bits[0][(n & 0x30) >> 2 | x]
-        error_bits_64[0][n] = n_1
-        error_bits_64[1][n] = n_2
+    for bit, nibbles in errors:
+        [[l_1, h_1], [l_2, h_2], [l_3, h_3]] = nibbles
+        # Mark this bit in the first table for all combinations of the first
+        # and second nibble that have this error
+        for n_1 in range(l_1, h_1+1):
+            for n_2 in range(l_2, h_2+1):
+                index = (n_1 & 0x3) << 4 | n_2
+                error_bits_64[0][index] |= 1 << bit
 
-    # Sanity check: splitting the indices up like we do should retain
-    # independence between the indices, which means we shouldn't lose any
-    # information. Make sure we can round-trip back to 16-entry tables.
-    e_rt = [[0] * 16 for i in range(3)]
-    for n in range(64):
-        # The second and third nibbles are easy: they both use the low four bits
-        # of their respective six-bit indices
-        e_rt[1][n & 0xF] |= error_bits_64[0][n]
-        e_rt[2][n & 0xF] |= error_bits_64[1][n]
-        # Reconstrucing the first nibble is weird, since the bits are divided.
-        # We loop over all possible values of both 64-bit indices, and set all
-        # the bits that are set in both entries for all possible values that
-        # correspond to each 4-bit index of the first nibble.
-        for x in range(64):
-            index_1 = (n >> 2) & 0xC | (x >> 4) & 0x3
-            index_2 = (n >> 4) & 0x3 | (x >> 2) & 0xC
-            e_rt[0][index_1] |= error_bits_64[1][n] & error_bits_64[0][x]
-            e_rt[0][index_2] |= error_bits_64[0][n] & error_bits_64[1][x]
-            # Err, well strictly speaking, this isn't a true round trip, due
-            # to the MARK_CONT bit. Since this isn't an actual error bit, it
-            # will never be set after the above ANDs. So, hackily add it back
-            # here for every value of the second 64-entry index that has it.
-            cont_bit = 1 << bit_map['MARK_CONT']
-            e_rt[0][index_1] |= error_bits_64[1][n] & cont_bit
-
-    assert error_bits == e_rt
+        # Likewise, mark this bit in the second table for the first/third nibble
+        for n_1 in range(l_1, h_1+1):
+            for n_3 in range(l_3, h_3+1):
+                index = (n_1 >> 2) << 4 | n_3
+                error_bits_64[1][index] |= 1 << bit
 
     return error_bits_64
 
@@ -293,7 +279,11 @@ def write_table(f, table, bit_map):
                 (n+1, t_len, t))
     # Add #defines for the names of the various bits. This is actually a lot
     # uglier than it seems: we'd really want to use an enum, but this generated
-    # table.h is included locally inside our validation function. 
+    # table.h is included locally inside our validation function, and we want
+    # to use these values outside of the function, so we just #define them.
+    # I don't want to generate two headers just to properly #undef these at the
+    # end of the file, so #undef them here so they at least won't collide when
+    # our library is #included multiple times. I apologize for the inelegance.
     for k in sorted(bit_map):
         f.write('#   undef %s\n' % k)
     for k, v in sorted(bit_map.items()):
@@ -302,9 +292,7 @@ def write_table(f, table, bit_map):
 def main(args):
     x86_table = make_bit_tables(x86_bit_map, flip_second_nibble=True)
     neon_table = make_bit_tables(neon_bit_map, flip_second_nibble=True)
-
-    avx512_table_16 = make_bit_tables(avx512_bit_map)
-    avx512_table = make_64_bit_tables(avx512_table_16, avx512_bit_map)
+    avx512_table = make_64_bit_tables(avx512_bit_map)
 
     # Write the output file
     output = open(args[1], 'w') if len(args) > 1 else sys.stdout

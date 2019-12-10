@@ -260,6 +260,18 @@ typedef struct {
 
 static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
         const uint32_t n) {
+    (void)n;
+    vec_t shift_indices = _mm512_setr_epi8(
+        127,0, 1, 2, 3, 4, 5, 6,
+         7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,
+        23,24,25,26,27,28,29,30,
+        31,32,33,34,35,36,37,38,
+        39,40,41,42,43,44,45,46,
+        47,48,49,50,51,52,53,54,
+        55,56,57,58,59,60,61,62
+    );
+    return _mm512_permutex2var_epi8(top, shift_indices, bottom);
 }
 
 // Load from the "data" pointer, but shifted one byte forward. We want to do
@@ -272,10 +284,10 @@ static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
 // suppression", but this in fact means that lanes not in the mask cannot
 // trigger page faults. See: https://stackoverflow.com/questions/54497141
 static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
-    vec_t result = _mm512_set1_epi8(first);
+    vec_t result = v_set1(first);
     // All bits but the first
     __mmask64 shift_mask = ~1ULL;
-    return _mm512_maskz_loadu_epi8(result, shift_mask, data - 1);
+    return _mm512_mask_loadu_epi8(result, shift_mask, data - 1);
 }
 
 #elif defined(SSE4)
@@ -420,7 +432,7 @@ typedef struct {
 #define USE_UNALIGNED_LOADS
 // How many vector's worth of input to process at a time in the inner loop.
 // ASCII early exits and error checking are only performed once for each chunk.
-#define UNROLL_COUNT    (6)
+#define UNROLL_COUNT    (12)
 
 #define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
@@ -444,14 +456,25 @@ static inline void NAME(init_state)(state_t *state) {
 #else
     state->carry_req = 0;
 #endif
+
+#if !defined(USE_NEXT_LOAD) && !defined(USE_UNALIGNED_LOADS)
+    state->last_bytes = v_set1(0);
+#endif
 }
 
-#if defined(USE_NEXT_LOAD)
 static inline void NAME(load_first)(state_t *state, const char *data, char first) {
+#if defined(USE_NEXT_LOAD)
     state->next_shifted_bytes = NAME(v_load_shift_first)(data, first);
-    state->bytes = v_set1(0);
-}
+#elif defined(USE_UNALIGNED_LOADS)
+    (void)state;
+    (void)data;
+    (void)first;
+#else
+    (void)data;
+    // Broadcast the first byte to all lanes. Only the last lane is used.
+    state->bytes = v_set1(first);
 #endif
+}
 
 static inline void NAME(load_next)(state_t *state, const char *data) {
 #if defined(USE_NEXT_LOAD)
@@ -469,7 +492,7 @@ static inline void NAME(load_next)(state_t *state, const char *data) {
 }
 
 static void UNUSED NAME(print_vec)(vec_t a) {
-    char buf[V_LEN];
+    char ALIGNED(V_LEN) buf[V_LEN];
     *(vec_t *)buf = a;
     printf("{");
     for (uint32_t i = 0; i < V_LEN; i++)
@@ -614,11 +637,14 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
 // This assumes that <data> is aligned to a V_LEN boundary, and that we can read
 // one byte before data. We only check for validation failures or ASCII-only
 // input once in this function, for entire input chunks.
-static inline int NAME(z_validate_unrolled_chunk)(state_t *state, const char *data) {
+static inline int NAME(z_validate_unrolled_chunk)(state_t *state,
+        const char *data) {
 #if defined(ASCII_CHECK)
-    // Quick skip for ASCII-only input. If there are no bytes with the
-    // high bit set, we can skip this chunk. If we expected any
-    // continuation bytes here, we return invalid, otherwise just skip.
+    // Quick skip for ASCII-only input. If there are no bytes with the high bit
+    // set, we can skip this chunk. If we expected any continuation bytes here,
+    // we return invalid, otherwise just skip it. Note that we have additional
+    // duplicated loads here that ideally should be kept in registers for the
+    // full validation loop below, which loads the same memory.
     vec_t ascii_vec = v_load(data);
     for (uint32_t i = 1; i < UNROLL_COUNT; i++)
         ascii_vec = v_or(ascii_vec, v_load(data + i * V_LEN));
@@ -627,7 +653,7 @@ static inline int NAME(z_validate_unrolled_chunk)(state_t *state, const char *da
         if (test_carry_req(state->carry_req))
             return 1;
 
-#if defined(USE_NEXT_LOAD)
+#if defined(USE_NEXT_LOAD) || !defined(USE_UNALIGNED_LOADS)
         // Set up the state for the next iteration by loading the last
         // vector. This is rather ugly...
         NAME(load_next)(state, data + (UNROLL_COUNT - 1) * V_LEN);
@@ -688,7 +714,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
     state_t state[1];
     NAME(init_state)(state);
 
-#if defined(USE_NEXT_LOAD)
+#if defined(USE_NEXT_LOAD) || !defined(USE_UNALIGNED_LOADS)
     // Get an aligned pointer to our input data. We round up to the next
     // multiple of V_LEN after data.
     intptr_t aligned_data_i = ((intptr_t)data + V_LEN - 1) & -V_LEN;
@@ -722,7 +748,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         // don't fill an entire UNROLL_SIZE-byte chunk
         aligned_len -= (aligned_len % UNROLL_SIZE);
 
-#if defined(USE_NEXT_LOAD)
+#if defined(USE_NEXT_LOAD) || !defined(USE_UNALIGNED_LOADS)
         // Only make the first load if the rounding above leaves us enough room
         if (aligned_len >= UNROLL_SIZE)
             NAME(load_first)(state, aligned_data,

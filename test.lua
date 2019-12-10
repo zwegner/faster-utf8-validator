@@ -243,7 +243,7 @@ for idx, test in ipairs(TEST_CASES) do
                     end
                 end
                 -- Break if we've run through the range of all bytes
-                if #test > 0 and not any_valid then
+                if not any_valid and (#test > 0 or offset > 0) then
                     break
                 end
 
