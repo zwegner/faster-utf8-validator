@@ -348,8 +348,10 @@ static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first
 #   define vmask_t          uint8x16_t
 
 #   define v_load(x)        vld1q_u8((uint8_t *)(x))
+#   define v_loadu(x)       vld1q_u8((uint8_t *)(x))
 #   define v_set1           vdupq_n_u8
 #   define v_and            vandq_u8
+#   define v_andn(a,b)      vbicq_u8((b), (a))
 #   define v_or             vorrq_u8
 #   define v_shl(x, shift)  ((shift) ? vshlq_n_u8((x), (shift)) : (x))
 #   define v_shr(x, shift)  ((shift) ? vshrq_n_u8((x), (shift)) : (x))
@@ -432,7 +434,7 @@ typedef struct {
 #define USE_UNALIGNED_LOADS
 // How many vector's worth of input to process at a time in the inner loop.
 // ASCII early exits and error checking are only performed once for each chunk.
-#define UNROLL_COUNT    (12)
+#define UNROLL_COUNT    (8)
 
 #define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
@@ -581,10 +583,17 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // in result.cont_error, mainly because some compilers (at least GCC 8)
     // aren't quite smart enough to hoist the AND out of the unrolled loop.
     // We instead put the AND in the final result_fails macro.
-    vec_t req_3 = v_shr(shift_1, ERR_SURR - MARK_CONT);
-    vec_t req_3_4 = vsraq_n_u8(req_3, shift_2, ERR_MAX2 - MARK_CONT);
+    if (1) {
+        vec_t req_3 = v_shr(shift_1, ERR_SURR - MARK_CONT);
+        vec_t req_3_4 = vsraq_n_u8(req_3, shift_2, ERR_MAX2 - MARK_CONT);
 
-    result.cont_error = veorq_u8(req_3_4, e_1_3);
+        result.cont_error = veorq_u8(req_3_4, e_1_3);
+    } else {
+        // XXX This saves a full vector instruction but is slower?? There is
+        // a longer dependency chain...
+        vec_t err_3 = vsraq_n_u8(e_1_3, shift_1, ERR_SURR - MARK_CONT);
+        result.cont_error = vsraq_n_u8(err_3, shift_2, ERR_MAX2 - MARK_CONT);
+    }
 
     *carry_req = e_1;
 

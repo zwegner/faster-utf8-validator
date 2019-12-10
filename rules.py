@@ -3,9 +3,10 @@ import itertools
 def rules(ctx):
     cc = ctx.vars.get('cc', 'cc')
     objdump = ctx.vars.get('objdump', 'objdump')
+    arch = ctx.vars.get('arch', 'native')
     files = ['z_validate']
     gen_dir = '_out/gen'
-    c_flags = ['-I%s' % gen_dir, '-fPIC', '-std=c11', '-march=native',
+    c_flags = ['-I%s' % gen_dir, '-fPIC', '-std=c11', '-march=%s' % arch,
         '-fdiagnostics-color=always', '-Wall', '-Wextra', '-Werror']
 
     # Create all arch/config combinations
