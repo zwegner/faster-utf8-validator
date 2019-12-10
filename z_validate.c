@@ -209,8 +209,8 @@ static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
     return _mm256_alignr_epi8(top, shl_16, 16 - 1);
 }
 
-static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data) {
-    return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
+    return NAME(v_shift_lanes)(v_set1(first), v_load(data), 1);
 }
 
 #elif defined(AVX512_VBMI)
@@ -271,10 +271,11 @@ static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
 // docs are rather vague here, just mentioning that masked loads have "fault
 // suppression", but this in fact means that lanes not in the mask cannot
 // trigger page faults. See: https://stackoverflow.com/questions/54497141
-static inline vec_t NAME(v_load_shift_first)(const char *data) {
+static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
+    vec_t result = _mm512_set1_epi8(first);
     // All bits but the first
     __mmask64 shift_mask = ~1ULL;
-    return _mm512_maskz_loadu_epi8(shift_mask, data - 1);
+    return _mm512_maskz_loadu_epi8(result, shift_mask, data - 1);
 }
 
 #elif defined(SSE4)
@@ -315,8 +316,8 @@ static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
     return _mm_alignr_epi8(top, bottom, 16 - 1);
 }
 
-static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data) {
-    return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
+    return NAME(v_shift_lanes)(v_set1(first), v_load(data), 1);
 }
 
 #elif defined(NEON)
@@ -359,8 +360,8 @@ static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
     return vextq_u8(bottom, top, 16 - n);
 }
 
-static inline vec_t NAME(v_load_shift_first)(const char *data) {
-    return NAME(v_shift_lanes)(v_set1(0), v_load(data), 1);
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
+    return NAME(v_shift_lanes)(v_set1(first), v_load(data), 1);
 }
 
 #else
@@ -408,9 +409,19 @@ typedef struct {
              UNLIKELY(v_test_any((r).lookup_error)))
 #endif
 
+// Some compile-time options for controlling the outer loop structure
+
+// Load one vector ahead in the inner loop. This really shouldn't make a big
+// difference, but at least with GCC 9 makes a strong positive impact.
+#define USE_NEXT_LOAD
+// Whether to get shifted_bytes with an unaligned load. Otherwise, it is
+// constructed with a vpalignr (or similar) instruction with two consecutive
+// vectors. Only used if USE_NEXT_LOAD is undefined.
 #define USE_UNALIGNED_LOADS
-//#define USE_NEXT_LOAD
+// How many vector's worth of input to process at a time in the inner loop.
+// ASCII early exits and error checking are only performed once for each chunk.
 #define UNROLL_COUNT    (6)
+
 #define UNROLL_SIZE     (UNROLL_COUNT * V_LEN)
 
 #define state_t     NAME(_state_t)
@@ -434,6 +445,13 @@ static inline void NAME(init_state)(state_t *state) {
     state->carry_req = 0;
 #endif
 }
+
+#if defined(USE_NEXT_LOAD)
+static inline void NAME(load_first)(state_t *state, const char *data, char first) {
+    state->next_shifted_bytes = NAME(v_load_shift_first)(data, first);
+    state->bytes = v_set1(0);
+}
+#endif
 
 static inline void NAME(load_next)(state_t *state, const char *data) {
 #if defined(USE_NEXT_LOAD)
@@ -609,9 +627,12 @@ static inline int NAME(z_validate_unrolled_chunk)(state_t *state, const char *da
         if (test_carry_req(state->carry_req))
             return 1;
 
+#if defined(USE_NEXT_LOAD)
         // Set up the state for the next iteration by loading the last
         // vector. This is rather ugly...
         NAME(load_next)(state, data + (UNROLL_COUNT - 1) * V_LEN);
+#endif
+
         return 0;
     }
 #endif
@@ -652,7 +673,7 @@ static inline int NAME(z_validate_small_chunk)(state_t *state, const char *data,
     char ALIGNED(V_LEN) buffer[V_LEN + 1] = { 0 };
     size_t offset = align_at_start ? 0 : V_LEN - len;
     buffer[offset] = first;
-    assert(len <= V_LEN);
+    //assert(len <= V_LEN);
     for (size_t i = 0; i < len; i++)
         buffer[offset + i + 1] = data[i];
 
@@ -667,12 +688,19 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
     state_t state[1];
     NAME(init_state)(state);
 
+#if defined(USE_NEXT_LOAD)
+    // Get an aligned pointer to our input data. We round up to the next
+    // multiple of V_LEN after data.
+    intptr_t aligned_data_i = ((intptr_t)data + V_LEN - 1) & -V_LEN;
+#else
     // Get an aligned pointer to our input data. We round up to the next
     // multiple of V_LEN after data + 1, since we need to read one byte before
     // the data pointer for shifted_bytes. This rounding is equivalent to
     // rounding down after adding V_LEN, which is what this does, by clearing
     // the low bits of the pointer (V_LEN is always a power of two).
-    const char *aligned_data = (const char *)(((intptr_t)data + V_LEN) & -V_LEN);
+    intptr_t aligned_data_i = ((intptr_t)data + V_LEN) & -V_LEN;
+#endif
+    const char *aligned_data = (const char *)aligned_data_i;
 
     if (aligned_data >= data + len) {
         // The input wasn't big enough to fill one vector
@@ -686,9 +714,20 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 
         // Get the size of the aligned inner section of data
         size_t aligned_len = len - (aligned_data - data);
+#if defined(USE_NEXT_LOAD)
+        // Make sure there are V_LEN-1 bytes at the end, as we load past the end
+        aligned_len = aligned_len > V_LEN - 1 ? aligned_len - (V_LEN - 1) : 0;
+#endif
         // Subtract from the aligned_len any bytes at the end of the input that
         // don't fill an entire UNROLL_SIZE-byte chunk
-        aligned_len = aligned_len - (aligned_len % UNROLL_SIZE);
+        aligned_len -= (aligned_len % UNROLL_SIZE);
+
+#if defined(USE_NEXT_LOAD)
+        // Only make the first load if the rounding above leaves us enough room
+        if (aligned_len >= UNROLL_SIZE)
+            NAME(load_first)(state, aligned_data,
+                    aligned_data > data ? aligned_data[-1] : '\0');
+#endif
 
         // Validate the main inner part of the input, in UNROLL_SIZE-byte chunks
         for (size_t offset = 0; offset < aligned_len; offset += UNROLL_SIZE) {
@@ -701,9 +740,9 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         const char *end_data = aligned_data + aligned_len;
         size_t end_len = (data + len) - end_data;
         for (size_t offset = 0; offset < end_len; offset += V_LEN) {
-            size_t l = end_len - offset;
-            l = l > V_LEN ? V_LEN : l;
-            if (NAME(z_validate_small_chunk)(state, end_data + offset, l,
+            size_t this_len = end_len - offset;
+            this_len = this_len > V_LEN ? V_LEN : this_len;
+            if (NAME(z_validate_small_chunk)(state, end_data + offset, this_len,
                         end_data[offset - 1], 1))
                 return 0;
         }
