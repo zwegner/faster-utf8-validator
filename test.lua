@@ -63,7 +63,7 @@ end
 
 if build then
     ffi.cdef('int system(const char *command);')
-    ffi.C.system(cmd)
+    assert(ffi.C.system(cmd) == 0, 'build failed')
 end
 
 -- Load libraries and create a table of all validator functions we're testing
