@@ -205,6 +205,8 @@ function test_validators(str, len, buffer, expected, count, fails)
     return count, fails
 end
 
+-- Keep track of which byte combinations have been seen for the first two bytes
+-- We make sure that every combination is tested.
 local seen = ffi.new('char [256][256]')
 
 for i = 0, 255 do

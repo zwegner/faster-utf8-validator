@@ -30,14 +30,19 @@
 #   include <immintrin.h>
 #endif
 
-// How this validator works:
+// faster-utf8-validator: Technical Details
+// ====
 //
-//   [[[ UTF-8 refresher: UTF-8 encodes text in sequences of "code points",
-//   each one from 1-4 bytes. For each code point that is longer than one byte,
-//   the code point begins with a unique prefix that specifies how many bytes
-//   follow. All bytes in the code point after this first have a continuation
-//   marker. All code points in UTF-8 will thus look like one of the following
-//   binary sequences, with x meaning "don't care":
+//   [[[ UTF-8 refresher: UTF-8 encodes text in sequences of "code points", each
+//   one from 1-4 bytes. The one byte code points are ASCII (UTF-8 is backwards
+//   compatible with ASCII). Each ASCII byte is in the range 0-127, with the
+//   high bit unset (it's a 7-bit format). For each code point that is longer
+//   than one byte, the code point begins with a unique prefix of bits that
+//   specifies how many bytes follow. The first byte in these N-byte sequences
+//   (I call these "leader bytes") have N 1's as their most significant bits.
+//   All bytes in the code point after the leader byte have a continuation
+//   marker in the top bits (10). All code points in UTF-8 will thus look like
+//   one of the following binary sequences, with x meaning "don't care":
 //      1 byte:  0xxxxxxx
 //      2 bytes: 110xxxxx  10xxxxxx
 //      3 bytes: 1110xxxx  10xxxxxx  10xxxxxx
@@ -45,57 +50,68 @@
 //   ]]]
 //
 // This validator works in two basic steps: checking continuation bytes, and
-// handling special cases. Each step works on one vector's worth of input
-// bytes at a time.
+// handling special cases. The special cases are handled first, and some data
+// from the special cases are used for continuation byte checking, so I'll
+// explain that first.
+// 
+// Special cases/table lookups
+// ====
 //
-// The continuation bytes are handled in a fairly straightforward manner in
-// the scalar domain. A mask is created from the input byte vector for each
-// of the highest four bits of every byte. The first mask allows us to quickly
-// skip pure ASCII input vectors, which have no bits set. The first and
-// (inverted) second masks together give us every continuation byte (10xxxxxx).
-// The other masks are used to find prefixes of multi-byte code points (110,
-// 1110, 11110). For these, we keep a "required continuation" mask, by shifting
-// these masks 1, 2, and 3 bits respectively forward in the byte stream. That
-// is, we take a mask of all bytes that start with 11, and shift it left one
-// bit forward to get the mask of all the first continuation bytes, then do the
-// same for the second and third continuation bytes. Here's an example input
-// sequence along with the corresponding masks:
+// Besides the basic prefix coding of UTF-8 mentioned above, there are several
+// invalid byte sequences that need to be detected. These are due to three
+// factors: code points that could be described in fewer bytes ("overlong"),
+// code points that are part of a "surrogate pair" (which are code points in a
+// specific range that are used in UTF-16 to express other code points as a pair
+// of 16-bit values, and are only valid in UTF-16), and code points that are
+// past the highest valid code point U+10FFFF.
 //
-//   bytes:        61 C3 80 62 E0 A0 80 63 F0 90 80 80 00
-//   code points:  61|C3 80|62|E0 A0 80|63|F0 90 80 80|00
-//   # of bytes:   1 |2  - |1 |3  -  - |1 |4  -  -  - |1
-//   cont. mask 1: -  -  1  -  -  1  -  -  -  1  -  -  -
-//   cont. mask 2: -  -  -  -  -  -  1  -  -  -  1  -  -
-//   cont. mask 3: -  -  -  -  -  -  -  -  -  -  -  1  -
-//   cont. mask *: 0  0  1  0  0  1  1  0  0  1  1  1  0
+// At a high level, the special case checking works using the typical SIMD
+// "shuffle" instruction. The way these instructions are used here are like
+// parallel table lookups for several bytes at a time. For example, in SSE, AVX,
+// and NEON, there are 16-way lookup instructions: for each byte of input in a
+// vector, the low four bits are used as an index into a 16-byte lookup table
+// (contained in another vector register). SSE and NEON can do this
+// 4-bit/16-byte lookup for 16 bytes at a time, and AVX2 can do the same for 32
+// bytes at a time (since it works like two copies of the SSE instruction
+// executed side-by-side).
 //
-// The final required continuation mask is then compared with the mask of
-// actual continuation bytes, and must match exactly in valid UTF-8. The only
-// complication in this step is that the shifted masks can cross vector
-// boundaries, so we need to keep a "carry" mask of the bits that were shifted
-// past the boundary in the last loop iteration.
+// All of the invalid special-case sequences can be detected by independently
+// observing the first three nibbles of each code point, looking up an error
+// mask from a 16 byte table for each using the above shuffle instructions.
+// For example, for checking the byte sequence 0xC1 0x82, we do three table
+// lookups, with the indices for the first code point being 0xC, 0x1, and 0x8.
+// This is only for the code point starting at the first byte, though; we check
+// several bytes at a time with these nifty SIMD instructions. The three nibbles
+// of a code point span two different bytes, so we need to compare the table
+// lookups from two adjacent bytes. For this, we get a vector with all the input
+// bytes shifted forward by one (typically using an unaligned load). In this
+// code, this is called "shifted_bytes".
 //
-// Besides the basic prefix coding of UTF-8, there are several invalid byte
-// sequences that need special handling. These are due to three factors:
-// code points that could be described in fewer bytes, code points that are
-// part of a surrogate pair (which are only valid in UTF-16), and code points
-// that are past the highest valid code point U+10FFFF.
+// All of the tables for these lookups are generated by some Python code
+// (gen_table.py), and are customized for each architecture.
 //
-// All of the invalid sequences can be detected by independently observing
-// the first three nibbles of each code point. Since AVX2 can do a 4-bit/16-byte
-// lookup in parallel for all 32 bytes in a vector, we can create bit masks
-// for all of these error conditions, look up the bit masks for the three
-// nibbles for all input bytes, and AND them together to get a final error mask,
-// that must be all zero for valid UTF-8. This is somewhat complicated by
-// needing to shift the error masks from the first and second nibbles forward in
-// the byte stream to line up with the third nibble.
+// A small visualization of an 8-byte sequence, and the indices for each of the
+// three nibble lookup-tables (all values in hexadecimal):
 //
-// We have these possible values for valid UTF-8 sequences, broken down
-// by the first three nibbles:
+//   bytes:         C1 82 61 F0 90 80 80 00
+//   shifted_bytes: 00 C1 82 61 F0 90 80 80
+//   1st index:     0  C  8  6  F  9  8  8  
+//   2nd index:      0  1  2  1  0  0  0  0 
+//   3nd index:     C  8  6  F  9  8  8  0 
+//
+// With these three table indices, we look up three result bytes from three
+// different tables for each contiguous grouping of three nibbles. We use each
+// byte as eight separate 1-bit flags, that can be compared by bitwise AND
+// across the three results. When the three result bytes all have an error bit
+// in common, we flag the input as invalid.
+//
+// Taking into account the prefix encoding and the three special cases, we have
+// these possible values for valid UTF-8 sequences, broken down by the first
+// three nibbles:
 //
 //   1st   2nd   3rd   comment
-//   0..7  0..F        ASCII
-//   8..B  0..F        continuation bytes
+//   0..7  0..F  -     ASCII
+//   8..B  0..F  -     continuation bytes
 //   C     2..F  8..B  C0 xx and C1 xx can be encoded in 1 byte
 //   D     0..F  8..B  D0..DF are valid with a continuation byte
 //   E     0     A..B  E0 8x and E0 9x can be encoded with 2 bytes
@@ -106,32 +122,126 @@
 //         1..3  8..B  F1..F3 are valid with continuation bytes
 //         4     8     F4 8F BF BF is the maximum valid code point
 //
-// That leaves us with these invalid sequences, which would otherwise fit
-// into UTF-8's prefix encoding. Each of these invalid sequences needs to
-// be detected separately, with their own bits in the error mask.
+// That leaves us with these invalid sequences, which would otherwise fit into
+// UTF-8's prefix encoding. Each of these invalid sequences needs to be detected
+// separately, with their own bits in the error mask. The symbolic name of each
+// error bit is listed--these are defined in gen_table.py.
 //
 //   1st   2nd   3rd   error bit
-//   C     0..1  0..F  0x01
-//   E     0     8..9  0x02
-//         D     A..B  0x04
-//   F     0     0..8  0x08
-//         4     9..F  0x10
-//         5..F  0..F  0x20
+//   C     0..1  0..F  ERR_OVER1
+//   E     0     8..9  ERR_OVER2
+//         D     A..B  ERR_SURR
+//   F     0     0..8  ERR_OVER3
+//         4     9..F  ERR_MAX1
+//         5..F  0..F  ERR_MAX2
 //
 // For every possible value of the first, second, and third nibbles, we keep
 // a lookup table that contains the bitwise OR of all errors that that nibble
-// value can cause. For example, the first nibble has zeroes in every entry
-// except for C, E, and F, and the third nibble lookup has the 0x21 bits in
-// every entry, since those errors don't depend on the third nibble. After
-// doing a parallel lookup of the first/second/third nibble values for all
-// bytes, we AND them together. Only when all three have an error bit in common
-// do we fail validation.
+// value can cause. For example, the first table has zeroes in every entry
+// except for C, E, and F, and the third nibble table has the ERR_OVER1 and
+// ERR_MAX2 bits set in every entry, since those errors don't depend on the
+// third nibble. After doing all the parallel lookups, we AND the three vectors
+// together. Only when all three have an error bit in common do we fail
+// validation.
+//
+// Also, note that all of the details above change for AVX-512 support (with the
+// VBMI extension). There, we have the awesome VPERMB instruction, which does
+// a 64-byte table lookup in parallel for each of 64 input bytes (using the low
+// six bits of each input byte), all in a mouth-watering three cycles. With the
+// six index bits we have, we can fit three nibble's worth of lookups into just
+// two 64-way lookups. The indexing scheme is described in (much) more detail in
+// gen_table.py, in the make_64_bit_tables() function.
+//
+// Extra info
+// ====
+//
+// So in the above lookup tables, we only use six bits for errors. We have two
+// extra bits that we can go nuts with, what should we do? (Hat tip to @aqrit
+// on github for pointing this possibility out)
+//
+// Turns out we can the extra bits for dealing with continuation bytes in two
+// different ways, allowing us to entirely skip a separate check for 2-byte
+// code points, and getting a mask of continuation bytes for free.
+//
+// These techniques are fairly arcane, and are described more in gen_table.py
+// (search for ERR_CONT, MARK_CONT, and MARK_CONT2).
+//
+// Continuation bytes
+// ====
+//
+// Well, compared to all that tricky lookup business, continuation bytes are a
+// walk in the park. Depending on the architecture, this is done in either
+// vector or scalar registers (see the USE_VECTOR_CONT_CHECK #define for
+// details).
+//
+// In either case, this involves creating a mask of required continuation bytes
+// by shifting the 3/4 byte markers from the lookup tables forward 3 and 4 bytes
+// respectively, and comparing those markers with the continuation marker, also
+// hidden in the lookup tables. This is the extra info mentioned above--note
+// that we don't check for two byte sequences, and the continuation markers are
+// only set for two consecutive continuation bytes (thus ignoring 2-byte
+// sequences, which only have one continuation byte).
+//
+// Here's an example input with # of bytes labeled for each code point, the
+// required continuation markers, and the actual continuation byte markers.
+// Observe that the continuation markers line up with the 3-byte markers shifted
+// forward by 2 bytes and the 4-byte markers shifted forward by 3, indicating
+// that this is valid UTF-8.
+//
+//   bytes:        61 C3 80 62 E0 A0 80 63 F0 90 80 80 00
+//   code points:  61|C3 80|62|E0 A0 80|63|F0 90 80 80|00
+//   # of bytes:   1 |2  - |1 |3  -  - |1 |4  -  -  - |1
+//   req. mark 3:  -  -  -  -  1  -  -  -  1  -  -  -  -
+//     shift:                  >-----v     >-----v 
+//   req. mark 4:  -  -  -  -  -  -  -  -  1  -  -  -  -
+//     shift:                              >--------v 
+//   cont. mark:   -  -  -  -  -  -  1  -  -  -  1  1  -
+//
+// Of course, this is different for AVX-512: there, we can't easily derive the
+// 3/4 byte markers from the lookup tables, and instead we use unsigned byte
+// comparisons with 0xE0 and 0xF0 respectively.
+//
+// Also, note that this needs special handling for when markers cross vector
+// boundaries: when a 3/4 byte leader byte is at the end of a vector, we must
+// make sure the next vector has the necessary continuation bytes. To do this we
+// keep a "carry" mask of the bits that were shifted past the boundary in the
+// last loop iteration.
 
+
+// Some compile-time options for controlling the outer loop structure
+
+// Load one vector ahead in the inner loop. This really shouldn't make a big
+// difference, but at least with GCC 9 makes a strong positive impact.
+#define USE_NEXT_LOAD           (1)
+// Whether to get shifted_bytes with an unaligned load. Otherwise, it is
+// constructed with a vpalignr (or similar) instruction with two consecutive
+// vectors. Only used if USE_NEXT_LOAD is undefined.
+#define USE_UNALIGNED_LOADS     (1)
+// How many vector's worth of input to process at a time in the inner loop.
+// ASCII early exits and error checking are only performed once for each chunk.
+#define UNROLL_COUNT            (6)
+
+#define UNROLL_SIZE             (UNROLL_COUNT * V_LEN)
+
+// Whether to do the continuation byte check in scalar or vector code
+// NEON doesn't have a movemask instruction, so it's better there to directly
+// compare in vector registers.
+// SSE has a movemask instruction, but it also has the cheap VPALIGNR
+// instruction, so that vector registers can be shifted easily.
+// AVX2 can only align within 16-byte lanes, and thus needs an extra
+// VPERM2I128 instruction for shifting vectors.
+// I believe AVX-512 needs to use a VPERMT2B instruction for shifting.
+// Thus for AVX2 and AVX-512 it's faster to use scalar shifts (in my tests).
+#if defined(NEON) || defined(SSE4)
+#   define USE_VECTOR_CONT_CHECK    (1)
+#else
+#   define USE_VECTOR_CONT_CHECK    (0)
+#endif
+
+// Various macros for GNU C extensions
 #define LIKELY(x)           __builtin_expect((x), (1))
 #define UNLIKELY(x)         __builtin_expect((x), (0))
-
 #define UNUSED              __attribute__((unused))
-
 #define ALIGNED(x)          __attribute__((aligned(x)))
 
 #define DEBUG(x)            //x
@@ -147,6 +257,10 @@
 #define NAME__(name, suff, ascii)   NAME_(name, suff, ascii)
 #define NAME(name)                  NAME__(name, SUFFIX, ASCII_SUFFIX)
 
+////////////////////////////////////////////////////////////////////////////////
+// Platform-specific configuration /////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
 #if defined(AVX2)
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -161,8 +275,12 @@
 // header can be included multiple times with different configurations
 
 #   define vec_t            __m256i
-#   define vmask_t          uint32_t
-#   define vmask2_t         uint64_t
+#   if USE_VECTOR_CONT_CHECK
+#       define vmask_t      vec_t
+#   else
+#       define vmask_t      uint32_t
+#       define vmask2_t     uint64_t
+#   endif
 
 #   define v_load(x)        _mm256_load_si256((vec_t *)(x))
 #   define v_loadu(x)       _mm256_lddqu_si256((vec_t *)(x))
@@ -170,6 +288,7 @@
 #   define v_and            _mm256_and_si256
 #   define v_andn           _mm256_andnot_si256
 #   define v_or             _mm256_or_si256
+#   define v_xor            _mm256_xor_si256
 #   define v_add            _mm256_add_epi32
 #   define v_shl(x, shift)  ((shift) ? _mm256_slli_epi16((x), (shift)) : (x))
 #   define v_shr(x, shift)  ((shift) ? _mm256_srli_epi16((x), (shift)) : (x))
@@ -184,10 +303,12 @@
 
 #   define v_lookup(table, index)   _mm256_shuffle_epi8((table), (index))
 
+#   define V_TABLE_32(...)    _mm256_setr_epi8(__VA_ARGS__)
+
 // Simple macro to make a vector lookup table for use with vpshufb. Since
 // AVX2 is two 16-byte halves, we duplicate the input values.
 
-#   define V_TABLE_16(...)    _mm256_setr_epi8(__VA_ARGS__, __VA_ARGS__)
+#   define V_TABLE_16(...)    V_TABLE_32(__VA_ARGS__, __VA_ARGS__)
 
 // Move all the bytes in "input" to the left by one and fill in the first
 // byte with zero. Since AVX2 generally works on two separate 16-byte
@@ -210,7 +331,8 @@ static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
         assert(!"unsupported lane shift");
 }
 
-static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data,
+        char first) {
     return NAME(v_shift_lanes)(v_set1(first), v_load(data), 1);
 }
 
@@ -277,11 +399,12 @@ static inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
 // this without touching memory before the pointer, since it might be unmapped.
 // Rather than mucking around with permutes or something to do this, we can use
 // a mask register to load starting from [data - 1], without actually loading
-// into the first byte of the vector (which is set to zero due to the _maskz
+// into the first byte of the vector (which is set to "first" due to the _mask
 // load variant). This will not fault if [data - 1] is invalid memory. Intel's
 // docs are rather vague here, just mentioning that masked loads have "fault
 // suppression", but this in fact means that lanes not in the mask cannot
 // trigger page faults. See: https://stackoverflow.com/questions/54497141
+// Thanks to Travis Downs for this idea.
 static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
     vec_t result = v_set1(first);
     // All bits but the first
@@ -300,8 +423,12 @@ static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
 #   define V_LEN            (16)
 
 #   define vec_t            __m128i
-#   define vmask_t          uint16_t
-#   define vmask2_t         uint32_t
+#   if USE_VECTOR_CONT_CHECK
+#       define vmask_t      vec_t
+#   else
+#       define vmask_t      uint16_t
+#       define vmask2_t     uint32_t
+#   endif
 
 #   define v_load(x)        _mm_load_si128((vec_t *)(x))
 #   define v_loadu(x)       _mm_lddqu_si128((vec_t *)(x))
@@ -309,6 +436,7 @@ static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
 #   define v_and            _mm_and_si128
 #   define v_andn           _mm_andnot_si128
 #   define v_or             _mm_or_si128
+#   define v_xor            _mm_xor_si128
 #   define v_add            _mm_add_epi32
 #   define v_shl(x, shift)  ((shift) ? _mm_slli_epi16((x), (shift)) : (x))
 #   define v_shr(x, shift)  ((shift) ? _mm_srli_epi16((x), (shift)) : (x))
@@ -323,6 +451,8 @@ static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
 
 static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
         const uint32_t n) {
+    // XXX can't use a shift from a variable at all, even when this is inlined
+    // as a constant
     if (n == 1)
         return _mm_alignr_epi8(top, bottom, 16 - 1);
     else if (n == 2)
@@ -331,7 +461,8 @@ static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
         assert(!"unsupported lane shift");
 }
 
-static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
+static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data,
+        char first) {
     return NAME(v_shift_lanes)(v_set1(first), v_load(data), 1);
 }
 
@@ -356,6 +487,7 @@ static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first
 #   define v_and            vandq_u8
 #   define v_andn(a,b)      vbicq_u8((b), (a))
 #   define v_or             vorrq_u8
+#   define v_xor            veorq_u8
 #   define v_shl(x, shift)  ((shift) ? vshlq_n_u8((x), (shift)) : (x))
 #   define v_shr(x, shift)  ((shift) ? vshrq_n_u8((x), (shift)) : (x))
 
@@ -400,17 +532,7 @@ typedef struct {
 // Some code paths for result checking are common between all x86 ISAs and
 // different on NEON. These are collected here.
 
-#if !defined(NEON)
-
-#   define vmask_or(a, b)       ((a) | (b))
-#   define vmask_zero()         (0)
-#   define mask_carry_req(r)    (r)
-#   define test_carry_req(r)    ((r) != 0)
-#   define result_fails(r)                                                  \
-            (UNLIKELY((r).cont_error != 0) ||                               \
-             UNLIKELY(v_test_any((r).lookup_error)))
-
-#else
+#if USE_VECTOR_CONT_CHECK
 
 #   define vmask_or         v_or
 #   define vmask_zero()     v_set1(0)
@@ -421,9 +543,17 @@ typedef struct {
 // the continuation marker bits are already shifted forward by one (due to
 // coming from the special case error lookups), the last two positions are
 // sufficient to catch any expected continuation bytes at the end.
-#   define mask_carry_req(r)                                                \
-        v_and((r), V_TABLE_16(0,0,0,0,0,0,0,0,0,0,0,0,0,0,                  \
-                        1 << ERR_MAX2, 1 << ERR_MAX2 | 1 << ERR_SURR))
+#   if V_LEN == 16
+#       define mask_carry_req(r)                                            \
+            v_and((r), V_TABLE_16(0,0,0,0,0,0,0,0,0,0,0,0,0,0,              \
+                        1u << MARK_4_BYTE, 1u << MARK_4_BYTE | 1u << MARK_3_BYTE))
+#   elif V_LEN == 32
+#       define mask_carry_req(r)                                            \
+            v_and((r), V_TABLE_32(0,0,0,0,0,0,0,0,0,0,0,0,0,0,              \
+                        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,                    \
+                        1u << MARK_4_BYTE, 1u << MARK_4_BYTE | 1u << MARK_3_BYTE))
+#   endif
+
 #   define test_carry_req(r)    v_test_any(mask_carry_req(r))
 // Mask out everything but the MARK_CONT bit from the cont_error. This is
 // just hoisting out an AND from the unrolled loop that the compiler can't
@@ -432,22 +562,17 @@ typedef struct {
             (UNLIKELY(v_test_bit((r).cont_error, MARK_CONT)) ||             \
              UNLIKELY(v_test_any((r).lookup_error)))
 
+#else
+
+#   define vmask_or(a, b)       ((a) | (b))
+#   define vmask_zero()         (0)
+#   define mask_carry_req(r)    (r)
+#   define test_carry_req(r)    ((r) != 0)
+#   define result_fails(r)                                                  \
+            (UNLIKELY((r).cont_error != 0) ||                               \
+             UNLIKELY(v_test_any((r).lookup_error)))
+
 #endif
-
-// Some compile-time options for controlling the outer loop structure
-
-// Load one vector ahead in the inner loop. This really shouldn't make a big
-// difference, but at least with GCC 9 makes a strong positive impact.
-#define USE_NEXT_LOAD           (1)
-// Whether to get shifted_bytes with an unaligned load. Otherwise, it is
-// constructed with a vpalignr (or similar) instruction with two consecutive
-// vectors. Only used if USE_NEXT_LOAD is undefined.
-#define USE_UNALIGNED_LOADS     (1)
-// How many vector's worth of input to process at a time in the inner loop.
-// ASCII early exits and error checking are only performed once for each chunk.
-#define UNROLL_COUNT            (6)
-
-#define UNROLL_SIZE             (UNROLL_COUNT * V_LEN)
 
 #define state_t     NAME(_state_t)
 typedef struct {
@@ -500,6 +625,16 @@ static inline void NAME(load_data)(state_t *state, const char *data) {
         state->shifted_bytes = NAME(v_shift_lanes)(state->last_bytes,
                 state->bytes, 1);
     }
+}
+
+#include <stdio.h>
+static void UNUSED NAME(print_vec)(vec_t a) {
+    char ALIGNED(V_LEN) buf[V_LEN];
+    *(vec_t *)buf = a;
+    printf("{");
+    for (uint32_t i = 0; i < V_LEN; i++)
+        printf("%2x,", buf[i] & 0xff);
+    printf("}\n");
 }
 
 // Validate one vector's worth of input bytes
@@ -571,7 +706,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // this is needed for ASCII->continuation to trigger the MARK_CONT2 error.
     result.lookup_error = v_andn(e_2, e_1_3);
 
-#if defined(NEON)
+# if USE_VECTOR_CONT_CHECK
 
     vec_t shift_1 = NAME(v_shift_lanes)(*carry_req, e_1, 1);
     vec_t shift_2 = NAME(v_shift_lanes)(*carry_req, e_1, 2);
@@ -583,21 +718,36 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // in result.cont_error, mainly because some compilers (at least GCC 8)
     // aren't quite smart enough to hoist the AND out of the unrolled loop.
     // We instead put the AND in the final result_fails macro.
+#   if defined(NEON)
+
     if (1) {
-        vec_t req_3 = v_shr(shift_1, ERR_SURR - MARK_CONT);
-        vec_t req_3_4 = vsraq_n_u8(req_3, shift_2, ERR_MAX2 - MARK_CONT);
+        vec_t req_3 = v_shr(shift_1, MARK_3_BYTE - MARK_CONT);
+        vec_t req_3_4 = vsraq_n_u8(req_3, shift_2, MARK_4_BYTE - MARK_CONT);
 
         result.cont_error = veorq_u8(req_3_4, e_1_3);
     } else {
         // XXX This saves a full vector instruction but is slower?? There is
         // a longer dependency chain...
-        vec_t err_3 = vsraq_n_u8(e_1_3, shift_1, ERR_SURR - MARK_CONT);
-        result.cont_error = vsraq_n_u8(err_3, shift_2, ERR_MAX2 - MARK_CONT);
+        vec_t err_3 = vsraq_n_u8(e_1_3, shift_1, MARK_3_BYTE - MARK_CONT);
+        result.cont_error = vsraq_n_u8(err_3, shift_2, MARK_4_BYTE - MARK_CONT);
     }
+
+#   else
+
+#     if MARK_CONT - MARK_4_BYTE != 1
+#       error "bad bit numbering"
+#     endif
+
+    vec_t req_3 = v_shl(shift_1, MARK_CONT - MARK_3_BYTE);
+    vec_t req_3_4 = v_or(req_3, v_add(shift_2, shift_2));
+
+    result.cont_error = v_xor(req_3_4, e_1_3);
+
+#   endif
 
     *carry_req = e_1;
 
-#else
+# else
 
     // req is a mask of what bytes are required to be continuation bytes after
     // the first, and cont is a mask of the continuation bytes after the first
@@ -608,9 +758,9 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // 11x, 111x, and 1111. For each of these prefixes, we get a bitmask
     // and shift it forward by 1, 2, or 3. This loop should be unrolled by
     // the compiler, and the (n == 1) branch inside eliminated.
-    vmask_t leader_3 = v_test_bit(e_1, ERR_SURR);
+    vmask_t leader_3 = v_test_bit(e_1, MARK_3_BYTE);
     // Micro-optimization: use x+x instead of x<<1, it's a tiny bit faster
-    vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), ERR_MAX2 + 1);
+    vmask_t leader_4 = v_test_bit(v_add(e_1, e_1), MARK_4_BYTE + 1);
 
     // We add the shifted mask here instead of ORing it, which would
     // be the more natural operation, so that this line can be done
@@ -756,7 +906,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
         aligned_len -= (aligned_len % UNROLL_SIZE);
 
         // Only make the first load if the rounding above leaves us enough room
-        if (aligned_len >= UNROLL_SIZE)
+        if (aligned_len > 0)
             NAME(load_first)(state, aligned_data,
                     aligned_data > data ? aligned_data[-1] : '\0');
 
@@ -808,6 +958,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 #undef v_and
 #undef v_andn
 #undef v_or
+#undef v_xor
 #undef v_add
 #undef v_shl
 #undef v_shr
@@ -819,6 +970,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 
 #undef vmask_or
 #undef vmask_zero
+#undef mask_carry_req
 #undef test_carry_req
 
 #undef USE_NEXT_LOAD

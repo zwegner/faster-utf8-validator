@@ -29,7 +29,8 @@ import sys
 # invalid sequence (as described in z_validate.c). The entries have a friendly
 # name of an error bit (which is mapped differently for different architectures)
 # and the values of the three nibbles. Each nibble can either be a single value
-# or a range of values.
+# or a range of values (denoted [lo, hi] with the range inclusive).
+NO_RANGE = [0, -1]
 error_nibbles = [
     # First continuation byte errors. Any byte following 0xCx..0xFx must be
     # in the range 0x80..0xBF
@@ -44,10 +45,17 @@ error_nibbles = [
     ['ERR_MAX1',  [ 0xF,        0x4,       [0x9, 0xF]]],
     ['ERR_MAX2',  [ 0xF,       [0x5, 0xF], [0x0, 0xF]]],
 
-    # Phony bit that overlaps with surrogate pair errors. This means we have a
-    # single bit in the error mask that is set for 0xEx and 0xFx, which allows
-    # us to find both 3 and 4 byte sequences with just one test.
-    ['ERR_SURR',  [ 0xF,       [0x0,  -1], [0x0,  -1]]],
+    # Phony bit that overlaps with surrogate pair errors. The ERR_SURR bit is
+    # already set for sequences starting with 0xED. All sequences that start
+    # with 0xFD are also invalid, but this is already handled by the ERR_MAX2
+    # bit. So we can add the ERR_SURR bit for 0xF as the first nibble. The
+    # reason for doing this is that we then have a single bit in the mask for
+    # the first nibble that is set for 0xEx and 0xFx, which allows us to find
+    # the leader bytes for 3/4 byte sequences with just one test. This might
+    # matter later if we wanted precise error reporting, which might show a
+    # spurious surrogate-pair error for 0xFD 0x80, but our API is just a bool
+    # now, so who cares...
+    ['ERR_SURR',  [ 0xF,       NO_RANGE,   NO_RANGE]],
 
     # Continuation bytes. The second nibble does not have any values here, to
     # make sure the final error mask will never be triggered--this is only a bit
@@ -68,7 +76,7 @@ error_nibbles = [
     # we only have two lookups, so we can't use the intermediate result from the
     # first and third nibble. Luckily, as described below, we organize the
     # tables to get the continuation bit for free on AVX-512 as well.
-    ['MARK_CONT', [[0x8, 0xB], [0x0,  -1], [0x8, 0xB]]],
+    ['MARK_CONT', [[0x8, 0xB], NO_RANGE,   [0x8, 0xB]]],
 
     # ...and if that wasn't a complicated enough explanation, there is one more
     # crazy trick here to take into account. One big problem with skipping the
@@ -100,8 +108,9 @@ error_nibbles = [
     # the point is that fixing the ASCII->cont. byte problem can be done almost
     # for free: we need one extra register to hold the 0x8F constant, but we
     # save a couple bytes in instruction encoding (vpandn is one byte shorter
-    # than vpand). For NEON, we don't get off quite so easily, since there's
-    # no AND NOT instruction. Shucks.
+    # than vpand). For NEON, we have the vbicq instruction, which is equivalent
+    # to and-not but with a weirder name (thanks to @jkeiser again for pointing
+    # this out, since the wacky name caused me to miss it).
     #
     # We give a different name to this bit error (MARK_CONT2), but it overlaps
     # with MARK_CONT for x86/NEON--they're the same bit. But, that won't work
@@ -116,7 +125,7 @@ error_nibbles = [
     # every value of the first index (which contains the low six bits of the
     # first byte). MARK_CONT and MARK_CONT2 can thus be discriminated in the
     # lookup tables, and trigger errors properly.
-    ['MARK_CONT2', [[0x0, 0x7], [0x0,  -1], [0x8, 0xB]]],
+    ['MARK_CONT2', [[0x0, 0x7], NO_RANGE,   [0x8, 0xB]]],
 ]
 
 # Bit maps: the different error bits are arranged differently for x86 and NEON
@@ -170,7 +179,7 @@ neon_bit_map = {
     'MARK_CONT2': 0
 }
 
-def make_bit_tables(bit_map, flip_second_nibble=False):
+def make_bit_tables(bit_map):
     # Transform single values to [n, n] ranges, and remap bits
     errors = [[bit_map[bit], [[n, n] if isinstance(n, int) else n
         for n in nibbles]] for bit, nibbles in error_nibbles]
@@ -182,12 +191,12 @@ def make_bit_tables(bit_map, flip_second_nibble=False):
             for value in range(lo, hi+1):
                 error_bits[n][value] |= 1 << bit
 
-    # Flip the second nibble if requested, as described above--for all the
-    # architectures that use 16-byte lookups (i.e. everything but AVX-512), the
-    # input and output bits for the second nibble table are both flipped. So we
-    # need to reverse the order of the table values and invert them.
-    if flip_second_nibble:
-        error_bits[1] = [0xFF ^ entry for entry in error_bits[1][::-1]]
+    # Flip the second nibble, as described above in the explanation for
+    # MARK_CONT2--for all the architectures that use 16-byte lookups (i.e.
+    # everything but AVX-512), the input and output bits for the second nibble
+    # table are both flipped. So we need to reverse the order of the table
+    # values and invert them.
+    error_bits[1] = [0xFF ^ entry for entry in error_bits[1][::-1]]
 
     return error_bits
 
@@ -200,14 +209,14 @@ def make_bit_tables(bit_map, flip_second_nibble=False):
 #
 #   nibble:         1--- 2--- 3---
 #   index 16:       xxxx yyyy zzzz
-#   bad index 64:   xxxx xxyy yyyy
-#   good index 64:  xxyy yyyy xxxx
+#   bad index 64:   aaaa aabb bbbb
+#   good index 64:  aabb bbbb aaaa
 #
 # This is done for three reasons:
 # 1) The first scheme does not have independence between the two halves of bits.
 #    Namely, the ERR_MAX1 and ERR_MAX2 bits need to distinguish between these
 #    cases:
-#       nibbles  indices
+#       nibbles  bad indexing scheme (binary)
 #       0xF48    [1111 01] [00 1000]  <-- legal
 #       0xF49    [1111 01] [00 1001]  <-- illegal
 #       0xF58    [1111 01] [01 1000]  <-- illegal
@@ -231,7 +240,7 @@ def make_bit_tables(bit_map, flip_second_nibble=False):
 #    pair of bytes. The first two bits of a byte are enough to identify all
 #    continuation bytes: they are always of the form 10xxxxxx. So, this lookup
 #    will already give us the continuation-bytes-after-the-first mask, without
-#    doing any extra masking.
+#    doing any extra masking--all the indices are of the form [01 01xx].
 #
 # There is one downside to this approach, though: since we split the bits of
 # the first nibble, we can't hide the 3/4-byte marker bits in the first lookup
@@ -278,6 +287,11 @@ def write_table(f, table, bit_map):
                 for x in range(0, t_len, step))
         f.write('const vec_t error_%s = V_TABLE_%s(\n    %s\n);\n' %
                 (n+1, t_len, t))
+
+    # Add aliases for bits that serve dual purposes
+    bit_map['MARK_3_BYTE'] = bit_map['ERR_SURR']
+    bit_map['MARK_4_BYTE'] = bit_map['ERR_MAX2']
+
     # Add #defines for the names of the various bits. This is actually a lot
     # uglier than it seems: we'd really want to use an enum, but this generated
     # table.h is included locally inside our validation function, and we want
@@ -291,8 +305,8 @@ def write_table(f, table, bit_map):
         f.write('#   define %-20s %s\n' % (k, v))
 
 def main(args):
-    x86_table = make_bit_tables(x86_bit_map, flip_second_nibble=True)
-    neon_table = make_bit_tables(neon_bit_map, flip_second_nibble=True)
+    x86_table = make_bit_tables(x86_bit_map)
+    neon_table = make_bit_tables(neon_bit_map)
     avx512_table = make_64_bit_tables(avx512_bit_map)
 
     # Write the output file
