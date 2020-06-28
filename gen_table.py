@@ -41,9 +41,13 @@ error_nibbles = [
     ['ERR_OVER1', [ 0xC,       [0x0, 0x1], [0x0, 0xF]]],
     ['ERR_OVER2', [ 0xE,        0x0,       [0x8, 0x9]]],
     ['ERR_SURR',  [ 0xE,        0xD,       [0xA, 0xB]]],
-    ['ERR_OVER3', [ 0xF,        0x0,       [0x0, 0x8]]],
-    ['ERR_MAX1',  [ 0xF,        0x4,       [0x9, 0xF]]],
-    ['ERR_MAX2',  [ 0xF,       [0x5, 0xF], [0x0, 0xF]]],
+    ['ERR_OVER3', [ 0xF,        0x0,       0x8]],
+    ['ERR_OVER3', [ 0xF,       [0x5, 0xF], 0x8]],
+    ['ERR_MAX1',  [ 0xF,       [0x4, 0xF], [0x9, 0xF]]],
+
+   #['ERR_OVER3', [ 0xF,        0x0,       [0x0, 0x8]]],
+   #['ERR_MAX1',  [ 0xF,        0x4,       [0x9, 0xF]]],
+   #['ERR_MAX2',  [ 0xF,       [0x5, 0xF], [0x0, 0xF]]],
 
     # Phony bit that overlaps with surrogate pair errors. The ERR_SURR bit is
     # already set for sequences starting with 0xED. All sequences that start
@@ -125,7 +129,7 @@ error_nibbles = [
     # every value of the first index (which contains the low six bits of the
     # first byte). MARK_CONT and MARK_CONT2 can thus be discriminated in the
     # lookup tables, and trigger errors properly.
-    ['MARK_CONT2', [[0x0, 0x7], NO_RANGE,   [0x8, 0xB]]],
+    ['MARK_CONT2', [[0x0, 0x7], [0x0, 0xF],[0x8, 0xB]]],
 ]
 
 # Bit maps: the different error bits are arranged differently for x86 and NEON
@@ -141,11 +145,11 @@ x86_bit_map = {
     'ERR_OVER1':  1,
     'ERR_OVER2':  2,
     'ERR_SURR':   3,
-    'ERR_OVER3':  4,
+    'ERR_OVER3':  6,
     'ERR_MAX1':   5,
-    'ERR_MAX2':   6,
+    #'ERR_MAX2':   6,
     'MARK_CONT':  7,
-    'MARK_CONT2': 7
+    'MARK_CONT2': 4
 }
 
 # The AVX-512 bit mapping is almost identical, save for one difference: here,
@@ -196,7 +200,7 @@ def make_bit_tables(bit_map):
     # everything but AVX-512), the input and output bits for the second nibble
     # table are both flipped. So we need to reverse the order of the table
     # values and invert them.
-    error_bits[1] = [0xFF ^ entry for entry in error_bits[1][::-1]]
+    #error_bits[1] = [0xFF ^ entry for entry in error_bits[1][::-1]]
 
     return error_bits
 
@@ -283,14 +287,27 @@ def write_table(f, table, bit_map):
     t_len = len(table[0])
     step = 8 if t_len == 64 else 4
     for n in range(len(table)):
+        if n == 1 and t_len == 16:
+            f.write('#if USE_NEW_VECTOR_CONT_CHECK\n')
+            extra_bit = ' | 0x%02Xu' % (1 << bit_map['MARK_CONT']) 
+            t = ',\n    '.join(', '.join('0x%02Xu%s' % (v, extra_bit)
+            for v in table[n][x:x+step])
+                    for x in range(0, t_len, step))
+            f.write('const vec_t error_%s = V_TABLE_%s(\n    %s\n);\n' %
+                    (n+1, t_len, t))
+            f.write('#else\n')
+
         t = ',\n    '.join(', '.join('0x%02X' % v for v in table[n][x:x+step])
                 for x in range(0, t_len, step))
         f.write('const vec_t error_%s = V_TABLE_%s(\n    %s\n);\n' %
                 (n+1, t_len, t))
 
+        if n == 1 and t_len == 16:
+            f.write('#endif\n')
+
     # Add aliases for bits that serve dual purposes
     bit_map['MARK_3_BYTE'] = bit_map['ERR_SURR']
-    bit_map['MARK_4_BYTE'] = bit_map['ERR_MAX2']
+    bit_map['MARK_4_BYTE'] = bit_map['ERR_OVER3']
 
     # Add #defines for the names of the various bits. This is actually a lot
     # uglier than it seems: we'd really want to use an enum, but this generated

@@ -148,7 +148,7 @@
 // VBMI extension). There, we have the awesome VPERMB instruction, which does
 // a 64-byte table lookup in parallel for each of 64 input bytes (using the low
 // six bits of each input byte), all in a mouth-watering three cycles. With the
-// six index bits we have, we can fit three nibble's worth of lookups into just
+// six index bits we have, we can fit three nibbles' worth of lookups into just
 // two 64-way lookups. The indexing scheme is described in (much) more detail in
 // gen_table.py, in the make_64_bit_tables() function.
 //
@@ -159,8 +159,8 @@
 // extra bits that we can go nuts with, what should we do? (Hat tip to @aqrit
 // on github for pointing this possibility out)
 //
-// Turns out we can the extra bits for dealing with continuation bytes in two
-// different ways, allowing us to entirely skip a separate check for 2-byte
+// Turns out we can use the extra bits for dealing with continuation bytes in
+// two different ways, allowing us to entirely skip a separate check for 2-byte
 // code points, and getting a mask of continuation bytes for free.
 //
 // These techniques are fairly arcane, and are described more in gen_table.py
@@ -210,9 +210,13 @@
 
 // Some compile-time options for controlling the outer loop structure
 
+#if !defined(USE_NEW_VECTOR_CONT_CHECK)
+#  define USE_NEW_VECTOR_CONT_CHECK   (0)
+#endif
+
 // Load one vector ahead in the inner loop. This really shouldn't make a big
 // difference, but at least with GCC 9 makes a strong positive impact.
-#define USE_NEXT_LOAD           (1)
+#define USE_NEXT_LOAD           !USE_NEW_VECTOR_CONT_CHECK
 // Whether to get shifted_bytes with an unaligned load. Otherwise, it is
 // constructed with a vpalignr (or similar) instruction with two consecutive
 // vectors. Only used if USE_NEXT_LOAD is undefined.
@@ -223,6 +227,10 @@
 
 #define UNROLL_SIZE             (UNROLL_COUNT * V_LEN)
 
+#if USE_NEW_VECTOR_CONT_CHECK && (USE_UNALIGNED_LOADS || USE_NEXT_LOAD || USE_VECTOR_CONT_CHECK)
+#  error "Incompatible options"
+#endif
+
 // Whether to do the continuation byte check in scalar or vector code
 // NEON doesn't have a movemask instruction, so it's better there to directly
 // compare in vector registers.
@@ -232,10 +240,12 @@
 // VPERM2I128 instruction for shifting vectors.
 // I believe AVX-512 needs to use a VPERMT2B instruction for shifting.
 // Thus for AVX2 and AVX-512 it's faster to use scalar shifts (in my tests).
-#if defined(NEON) || defined(SSE4)
+#if !defined(USE_VECTOR_CONT_CHECK)
+#  if !USE_NEW_VECTOR_CONT_CHECK && (defined(NEON) || defined(SSE4))
 #   define USE_VECTOR_CONT_CHECK    (1)
-#else
+#  else
 #   define USE_VECTOR_CONT_CHECK    (0)
+#  endif
 #endif
 
 // Various macros for GNU C extensions
@@ -290,6 +300,9 @@
 #   define v_or             _mm256_or_si256
 #   define v_xor            _mm256_xor_si256
 #   define v_add            _mm256_add_epi32
+#   define v_usubs          _mm256_subs_epu8
+#   define v_sgt            _mm256_cmpgt_epi8
+#   define v_insert         _mm256_insert_epi8
 #   define v_shl(x, shift)  ((shift) ? _mm256_slli_epi16((x), (shift)) : (x))
 #   define v_shr(x, shift)  ((shift) ? _mm256_srli_epi16((x), (shift)) : (x))
 
@@ -323,10 +336,14 @@ static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
     // XXX can't use a shift from a variable at all, even when this is inlined
     // as a constant
     vec_t shl_16 = _mm256_permute2x128_si256(top, bottom, 0x03);
-    if (n == 1)
+    if (n == 0)
+        return top;
+    else if (n == 1)
         return _mm256_alignr_epi8(top, shl_16, 16 - 1);
     else if (n == 2)
         return _mm256_alignr_epi8(top, shl_16, 16 - 2);
+    else if (n == 3)
+        return _mm256_alignr_epi8(top, shl_16, 16 - 3);
     else
         assert(!"unsupported lane shift");
 }
@@ -438,6 +455,9 @@ static inline vec_t NAME(v_load_shift_first)(const char *data, char first) {
 #   define v_or             _mm_or_si128
 #   define v_xor            _mm_xor_si128
 #   define v_add            _mm_add_epi32
+#   define v_usubs          _mm_subs_epu8
+#   define v_sgt            _mm_cmpgt_epi8
+#   define v_insert         _mm_insert_epi8
 #   define v_shl(x, shift)  ((shift) ? _mm_slli_epi16((x), (shift)) : (x))
 #   define v_shr(x, shift)  ((shift) ? _mm_srli_epi16((x), (shift)) : (x))
 
@@ -453,10 +473,14 @@ static UNUSED inline vec_t NAME(v_shift_lanes)(vec_t bottom, vec_t top,
         const uint32_t n) {
     // XXX can't use a shift from a variable at all, even when this is inlined
     // as a constant
-    if (n == 1)
+    if (n == 0)
+        return top;
+    else if (n == 1)
         return _mm_alignr_epi8(top, bottom, 16 - 1);
     else if (n == 2)
         return _mm_alignr_epi8(top, bottom, 16 - 2);
+    else if (n == 3)
+        return _mm_alignr_epi8(top, bottom, 16 - 3);
     else
         assert(!"unsupported lane shift");
 }
@@ -525,16 +549,38 @@ static UNUSED inline vec_t NAME(v_load_shift_first)(const char *data, char first
 // branch once for several vectors' worth of results.
 #define result_t    NAME(_result_t)
 typedef struct {
+#if USE_NEW_VECTOR_CONT_CHECK
+    vec_t error;
+#else
     vec_t lookup_error;
     vmask_t cont_error;
+#endif
 } result_t;
 
 // Some code paths for result checking are common between all x86 ISAs and
 // different on NEON. These are collected here.
+#if USE_NEW_VECTOR_CONT_CHECK
 
-#if USE_VECTOR_CONT_CHECK
+#   define vmask_zero()     (0)
+#   if V_LEN == 16
+#       define is_incomplete(r)                                            \
+            v_usubs((r), V_TABLE_16(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, \
+                        0xEF, 0xDF, 0xBF))
+#   elif V_LEN == 32
+#       define is_incomplete(r)                                            \
+            v_usubs((r), V_TABLE_32(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,\
+                        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,      \
+                        0xEF, 0xDF, 0xBF))
+#   endif
 
-#   define vmask_or         v_or
+#   define test_carry_req(s)    v_test_any(is_incomplete(s->last_bytes))
+#   define result_fails(r)      UNLIKELY(v_test_any((r).error))
+#   define combine_results(r1, r2) do { \
+        r1.error = v_or(r1.error, r2.error); \
+    } while (0)
+
+#elif USE_VECTOR_CONT_CHECK
+
 #   define vmask_zero()     v_set1(0)
 // In the NEON code paths, we keep continuation byte masks as vectors, and need
 // a special test at the end of the input to make sure we weren't expecting
@@ -554,7 +600,7 @@ typedef struct {
                         1u << MARK_4_BYTE, 1u << MARK_4_BYTE | 1u << MARK_3_BYTE))
 #   endif
 
-#   define test_carry_req(r)    v_test_any(mask_carry_req(r))
+#   define test_carry_req(s)    v_test_any(mask_carry_req(s->carry_req))
 // Mask out everything but the MARK_CONT bit from the cont_error. This is
 // just hoisting out an AND from the unrolled loop that the compiler can't
 // really be trusted to do itself.
@@ -562,15 +608,24 @@ typedef struct {
             (UNLIKELY(v_test_bit((r).cont_error, MARK_CONT)) ||             \
              UNLIKELY(v_test_any((r).lookup_error)))
 
+#   define combine_results(r1, r2) do { \
+        r1.lookup_error = v_or(r1.lookup_error, r2.lookup_error); \
+        r1.cont_error = v_or(r1.cont_error, r2.cont_error); \
+    } while (0)
+
 #else
 
-#   define vmask_or(a, b)       ((a) | (b))
 #   define vmask_zero()         (0)
 #   define mask_carry_req(r)    (r)
-#   define test_carry_req(r)    ((r) != 0)
+#   define test_carry_req(s)    ((s->carry_req) != 0)
 #   define result_fails(r)                                                  \
             (UNLIKELY((r).cont_error != 0) ||                               \
              UNLIKELY(v_test_any((r).lookup_error)))
+
+#   define combine_results(r1, r2) do { \
+        r1.lookup_error = v_or(r1.lookup_error, r2.lookup_error); \
+        r1.cont_error = r1.cont_error | r2.cont_error; \
+    } while (0)
 
 #endif
 
@@ -587,46 +642,6 @@ typedef struct {
     vmask_t carry_req;
 } state_t;
 
-static inline void NAME(init_state)(state_t *state) {
-    state->carry_req = vmask_zero();
-
-    if (!USE_NEXT_LOAD && ! USE_UNALIGNED_LOADS)
-        state->last_bytes = v_set1(0);
-}
-
-static inline void NAME(load_first)(UNUSED state_t *state,
-        UNUSED const char *data, UNUSED char first) {
-    if (USE_NEXT_LOAD)
-        state->next_shifted_bytes = NAME(v_load_shift_first)(data, first);
-    else if (!USE_UNALIGNED_LOADS)
-        // Broadcast the first byte to all lanes. Only the last lane is used.
-        state->bytes = v_set1(first);
-}
-
-static inline UNUSED void NAME(load_next)(UNUSED state_t *state,
-        UNUSED const char *data) {
-    if (USE_NEXT_LOAD)
-        state->next_shifted_bytes = v_loadu(data + V_LEN - 1);
-    else if (!USE_UNALIGNED_LOADS)
-        state->bytes = v_load(data);
-}
-
-static inline void NAME(load_data)(state_t *state, const char *data) {
-    if (USE_NEXT_LOAD) {
-        state->bytes = v_load(data);
-        state->shifted_bytes = state->next_shifted_bytes;
-        state->next_shifted_bytes = v_loadu(data + V_LEN - 1);
-    } else if (USE_UNALIGNED_LOADS) {
-        state->shifted_bytes = v_loadu(data - 1);
-        state->bytes = v_load(data);
-    } else {
-        state->last_bytes = state->bytes;
-        state->bytes = v_load(data);
-        state->shifted_bytes = NAME(v_shift_lanes)(state->last_bytes,
-                state->bytes, 1);
-    }
-}
-
 #include <stdio.h>
 static void UNUSED NAME(print_vec)(vec_t a) {
     char ALIGNED(V_LEN) buf[V_LEN];
@@ -636,27 +651,101 @@ static void UNUSED NAME(print_vec)(vec_t a) {
         printf("%2x,", buf[i] & 0xff);
     printf("}\n");
 }
+#define PRINT 0
+
+static inline void NAME(init_state)(state_t *state) {
+    state->carry_req = vmask_zero();
+
+    if (!USE_NEXT_LOAD && !USE_UNALIGNED_LOADS)
+        state->last_bytes = v_set1(0);
+}
+
+static inline void NAME(load_first)(UNUSED state_t *state,
+        UNUSED const char *data, UNUSED size_t pre_len) {
+    if (USE_NEXT_LOAD)
+        state->next_shifted_bytes = NAME(v_load_shift_first)(data,
+                pre_len > 0 ? data[-1] : '\0');
+    else if (!USE_UNALIGNED_LOADS) {
+        vec_t bytes = v_set1(0);
+
+        if (pre_len > 3)
+            pre_len = 3;
+        switch (pre_len) {
+            case 3: bytes = v_insert(bytes, data[-3], V_LEN - 3); // FALLTHROUGH
+            case 2: bytes = v_insert(bytes, data[-2], V_LEN - 2); // FALLTHROUGH
+            case 1: bytes = v_insert(bytes, data[-1], V_LEN - 1);
+        }
+        state->bytes = bytes;
+    }
+}
+
+static inline UNUSED void NAME(load_next)(UNUSED state_t *state,
+        UNUSED const char *data) {
+    if (USE_NEXT_LOAD)
+        state->next_shifted_bytes = v_loadu(data + V_LEN - 1);
+    else if (!USE_UNALIGNED_LOADS) {
+        state->bytes = v_load(data);
+        if (USE_NEW_VECTOR_CONT_CHECK)
+            state->last_bytes = state->bytes;
+    }
+}
+
+static inline void NAME(load_data)(state_t *state, const char *data) {
+    if (USE_NEXT_LOAD) {
+#if PRINT
+        puts("PRELOAD");
+        NAME(print_vec)(state->last_bytes);
+        NAME(print_vec)(state->bytes);
+        NAME(print_vec)(state->shifted_bytes);
+        puts("");
+#endif
+
+        state->bytes = v_load(data);
+        state->shifted_bytes = state->next_shifted_bytes;
+        state->next_shifted_bytes = v_loadu(data + V_LEN - 1);
+
+#if PRINT
+        NAME(print_vec)(state->last_bytes);
+        NAME(print_vec)(state->bytes);
+        NAME(print_vec)(state->shifted_bytes);
+        puts("");
+#endif
+    } else if (USE_UNALIGNED_LOADS) {
+        state->shifted_bytes = v_loadu(data - 1);
+        state->bytes = v_load(data);
+    } else {
+        state->last_bytes = state->bytes;
+        state->bytes = v_load(data);
+        state->shifted_bytes = NAME(v_shift_lanes)(state->last_bytes,
+                state->bytes, 1);
+#if PRINT
+        puts("LOAD");
+        NAME(print_vec)(state->last_bytes);
+        NAME(print_vec)(state->bytes);
+        puts("");
+#endif
+    }
+}
 
 // Validate one vector's worth of input bytes
-static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
-        vmask_t *carry_req) {
+static inline result_t NAME(z_validate_vec)(state_t *state) {
     result_t result;
 
     // Add error masks as locals
 #include "table.h"
 
 #if defined(AVX512_VBMI)
-    vmask2_t req = { *carry_req, 0 };
+    vmask2_t req = { state->carry_req, 0 };
 
     // Look up error masks for the two 6-bit indices
-    vec_t e_1 = v_lookup_64(error_1, shifted_bytes);
+    vec_t e_1 = v_lookup_64(error_1, state->shifted_bytes);
     // Bitwise select: we want to combine the top two bits from shifted_bytes
     // with the bottom four bits from bytes, which we can do with one ternary
     // logic operation. 0xCA is an 8x1 bit lookup table, equivalent to
     // (a ? c : b). Using 0xF0 as the selector (a), we select between the
     // appropriately-shifted values of shifted_bytes (b) or bytes (c).
     vec_t index_2 = _mm512_ternarylogic_epi32(v_set1(0xF0),
-            v_shr(shifted_bytes, 2), v_shr(bytes, 4), 0xCA);
+            v_shr(state->shifted_bytes, 2), v_shr(state->bytes, 4), 0xCA);
     vec_t e_2 = v_lookup_64(error_2, index_2);
 
     // Check if any bits are set in both error masks
@@ -671,7 +760,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // relevant bits in the error tables. So just use unsigned byte compares,
     // which should be quite similar in speed to pulling the bits out anyways.
     for (int n = 2; n <= 3; n++) {
-        vmask_t set = _mm512_cmpge_epu8_mask(bytes, v_set1(0xFF << (7-n)));
+        vmask_t set = _mm512_cmpge_epu8_mask(state->bytes, v_set1(0xFF << (7-n)));
 
         // Add shifted bits for required continuation bytes
         req.lo += set << n;
@@ -679,7 +768,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     }
 
     // Save required continuation bits for the next round
-    *carry_req = req.hi;
+    state->carry_req = req.hi;
 
     result.cont_error = (cont ^ req.lo);
 
@@ -689,9 +778,10 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // special trick for the second nibble (as described in gen_table.py for
     // the MARK_CONT2 bit). There, we invert shifted_bytes and AND with 0x8F
     // with one AND NOT instruction, which zeroes out e_2 for ASCII input.
-    vec_t e_1 = v_lookup(error_1, v_and(v_shr(shifted_bytes, 4), v_set1(0x0F)));
-    vec_t e_2 = v_lookup(error_2, v_andn(shifted_bytes, v_set1(0x8F)));
-    vec_t e_3 = v_lookup(error_3, v_and(v_shr(bytes, 4), v_set1(0x0F)));
+    vec_t e_1 = v_lookup(error_1, v_and(v_shr(state->shifted_bytes, 4), v_set1(0x0F)));
+    //vec_t e_2 = v_lookup(error_2, v_andn(state->shifted_bytes, v_set1(0xFF)));
+    vec_t e_2 = v_lookup(error_2, v_and(state->shifted_bytes, v_set1(0x0F)));
+    vec_t e_3 = v_lookup(error_3, v_and(v_shr(state->bytes, 4), v_set1(0x0F)));
 
     // Get error bits common between the first and third nibbles. This is a
     // subexpression used for ANDing all three nibbles, but is also used for
@@ -704,12 +794,46 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     // Create the result vector with any bits set in all three error masks.
     // Note that we use AND NOT here, because the bits in e_2 are inverted--
     // this is needed for ASCII->continuation to trigger the MARK_CONT2 error.
-    result.lookup_error = v_andn(e_2, e_1_3);
+    //result.lookup_error = v_andn(e_2, e_1_3);
+# if !USE_NEW_VECTOR_CONT_CHECK
+    result.lookup_error = v_and(e_2, e_1_3);
+# endif
 
-# if USE_VECTOR_CONT_CHECK
+#if PRINT
+    NAME(print_vec)(state->last_bytes);
+    NAME(print_vec)(state->bytes);
+    NAME(print_vec)(state->shifted_bytes);
+    NAME(print_vec)(e_1);
+    NAME(print_vec)(e_2);
+    NAME(print_vec)(e_3);
+    NAME(print_vec)(result.lookup_error);
+    puts("");
+#endif
 
-    vec_t shift_1 = NAME(v_shift_lanes)(*carry_req, e_1, 1);
-    vec_t shift_2 = NAME(v_shift_lanes)(*carry_req, e_1, 2);
+# if USE_NEW_VECTOR_CONT_CHECK
+
+    vec_t shift_2 = NAME(v_shift_lanes)(state->last_bytes, state->bytes, 2);
+    vec_t shift_3 = NAME(v_shift_lanes)(state->last_bytes, state->bytes, 3);
+    vec_t v_3_4 = v_or(v_usubs(shift_2, v_set1(0xDF)), v_usubs(shift_3, v_set1(0xEF)));
+    vec_t req_3_4 = v_and(v_sgt(v_3_4, v_set1(0)), v_set1((uint32_t)1 << MARK_CONT));
+    result.error = v_xor(v_and(e_2, e_1_3), req_3_4);
+
+#if PRINT
+    NAME(print_vec)(state->last_bytes);
+    NAME(print_vec)(state->bytes);
+    NAME(print_vec)(state->shifted_bytes);
+    NAME(print_vec)(shift_2);
+    NAME(print_vec)(shift_3);
+    NAME(print_vec)(v_3_4);
+    NAME(print_vec)(req_3_4);
+    NAME(print_vec)(result.error);
+    puts("");
+#endif
+
+# elif USE_VECTOR_CONT_CHECK
+
+    vec_t shift_1 = NAME(v_shift_lanes)(state->carry_req, e_1, 1);
+    vec_t shift_2 = NAME(v_shift_lanes)(state->carry_req, e_1, 2);
     // Shift the 3/4 byte marker bits into place for the MARK_CONT bit,
     // and add them together. This is safe for similar reasons to the +=
     // explanation in the below x86 path, and because we use MARK_CONT==1<<0
@@ -745,13 +869,13 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
 
 #   endif
 
-    *carry_req = e_1;
+    state->carry_req = e_1;
 
 # else
 
     // req is a mask of what bytes are required to be continuation bytes after
     // the first, and cont is a mask of the continuation bytes after the first
-    vmask2_t req = *carry_req;
+    vmask2_t req = state->carry_req;
     vmask_t cont = v_test_bit(e_1_3, MARK_CONT);
 
     // Compute the continuation byte mask by finding bytes that start with
@@ -778,7 +902,7 @@ static inline result_t NAME(z_validate_vec)(vec_t bytes, vec_t shifted_bytes,
     req += (vmask2_t)leader_3 << 1;
 
     // Save continuation bits and input bytes for the next round
-    *carry_req = req >> V_LEN;
+    state->carry_req = req >> V_LEN;
 
     // Check that continuation bytes match. We must cast req from vmask2_t
     // (which holds the carry mask in the upper half) to vmask_t, which
@@ -809,7 +933,7 @@ static inline int NAME(z_validate_unrolled_chunk)(state_t *state,
         ascii_vec = v_or(ascii_vec, v_load(data + i * V_LEN));
 
     if (LIKELY(!v_test_bit(ascii_vec, 7))) {
-        if (UNLIKELY(test_carry_req(state->carry_req)))
+        if (UNLIKELY(test_carry_req(state)))
             return 1;
 
         // Set up the state for the next iteration by loading the last
@@ -824,15 +948,12 @@ static inline int NAME(z_validate_unrolled_chunk)(state_t *state,
     // doesn't optimize v_or(0, x) into x, so manually unroll the first
     // iteration
     NAME(load_data)(state, data + 0 * V_LEN);
-    result_t result = NAME(z_validate_vec)(state->bytes,
-            state->shifted_bytes, &state->carry_req);
+    result_t result = NAME(z_validate_vec)(state);
     for (uint32_t i = 1; i < UNROLL_COUNT; i++) {
         NAME(load_data)(state, data + i * V_LEN);
-        result_t r = NAME(z_validate_vec)(state->bytes,
-                state->shifted_bytes, &state->carry_req);
+        result_t r = NAME(z_validate_vec)(state);
 
-        result.lookup_error = v_or(result.lookup_error, r.lookup_error);
-        result.cont_error = vmask_or(result.cont_error, r.cont_error);
+        combine_results(result, r);
     }
 
     return result_fails(result);
@@ -850,20 +971,34 @@ static inline int NAME(z_validate_unrolled_chunk)(state_t *state,
 // consistently across the entire input--it can be thought of like padding the
 // input data with NUL bytes on either side.
 static inline int NAME(z_validate_small_chunk)(state_t *state, const char *data,
-        size_t len, char first, int align_at_start) {
+        ssize_t len, ssize_t pre_len, int align_at_start) {
     // Deal with any bytes remaining. Rather than making a separate scalar path,
     // just fill in a buffer, reading bytes only up to len, and load from that.
-    char ALIGNED(V_LEN) buffer[V_LEN + 1] = { 0 };
-    size_t offset = align_at_start ? 0 : V_LEN - len;
-    buffer[offset] = first;
-    //assert(len <= V_LEN);
-    for (size_t i = 0; i < len; i++)
-        buffer[offset + i + 1] = data[i];
+    char ALIGNED(V_LEN) buffer[2 * V_LEN] = { 0 };
+    size_t offset = align_at_start ? V_LEN : 2 * V_LEN - len;
+    assert(len <= V_LEN);
+    if (pre_len > 3)
+        pre_len = 3;
+    for (ssize_t i = -pre_len; i < len; i++)
+        buffer[offset + i] = data[i];
 
-    vec_t bytes = v_loadu(buffer + 1);
-    vec_t shifted_bytes = v_load(buffer);
-    result_t result = NAME(z_validate_vec)(bytes, shifted_bytes,
-            &state->carry_req);
+#if PRINT
+    printf("DATA: ");
+    for (ssize_t i = 0; i < len; i++)
+        printf("%2x,", data[i] & 0xff);
+    printf("\nPRE: ");
+    for (ssize_t i = 0; i < pre_len; i++)
+        printf("%2x,", data[-i-1] & 0xff);
+    printf("\n{");
+    for (ssize_t i = 0; i < V_LEN*2; i++)
+        printf("%2x,", buffer[i] & 0xff);
+    printf("} off=%lu\n\n", offset);
+#endif
+
+    state->last_bytes = v_load(buffer);
+    state->bytes = v_load(buffer + V_LEN);
+    state->shifted_bytes = v_loadu(buffer + V_LEN - 1);
+    result_t result = NAME(z_validate_vec)(state);
     return result_fails(result);
 }
 
@@ -887,12 +1022,11 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 
     if (aligned_data >= data + len) {
         // The input wasn't big enough to fill one vector
-        if (NAME(z_validate_small_chunk)(state, data, len, '\0', 0))
+        if (NAME(z_validate_small_chunk)(state, data, len, 0, 0))
             return 0;
     } else {
         // Validate the start section between data and aligned_data
-        if (NAME(z_validate_small_chunk)(state, data, aligned_data - data,
-                '\0', 0))
+        if (NAME(z_validate_small_chunk)(state, data, aligned_data - data, 0, 0))
             return 0;
 
         // Get the size of the aligned inner section of data
@@ -907,8 +1041,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
 
         // Only make the first load if the rounding above leaves us enough room
         if (aligned_len > 0)
-            NAME(load_first)(state, aligned_data,
-                    aligned_data > data ? aligned_data[-1] : '\0');
+            NAME(load_first)(state, aligned_data, aligned_data - data);
 
         // Validate the main inner part of the input, in UNROLL_SIZE-byte chunks
         for (size_t offset = 0; offset < aligned_len; offset += UNROLL_SIZE) {
@@ -924,7 +1057,7 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
             size_t this_len = end_len - offset;
             this_len = this_len > V_LEN ? V_LEN : this_len;
             if (NAME(z_validate_small_chunk)(state, end_data + offset, this_len,
-                        end_data[offset - 1], 1))
+                        end_data + offset - data, 1))
                 return 0;
         }
     }
@@ -937,43 +1070,48 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
     if (len > 0 && (uint8_t)data[len - 1] >= 0xC0)
         return 0;
 
+#if USE_NEW_VECTOR_CONT_CHECK
+    state->last_bytes = state->bytes;
+#endif
+
     // The input is valid if we don't have any more expected continuation bytes
-    return !test_carry_req(state->carry_req);
+    return !test_carry_req(state);
 }
 
 // Undefine all macros
 
-#undef NAME
-#undef ASCII_SUFFIX
-#undef SUFFIX
-#undef V_LEN
-
-#undef vec_t
-#undef vmask_t
-#undef vmask2_t
-
-#undef v_load
-#undef v_loadu
-#undef v_set1
-#undef v_and
-#undef v_andn
-#undef v_or
-#undef v_xor
-#undef v_add
-#undef v_shl
-#undef v_shr
-#undef v_test_any
-#undef v_test_bit
-#undef v_lookup
-#undef V_TABLE_16
-#undef V_TABLE_64
-
-#undef vmask_or
-#undef vmask_zero
-#undef mask_carry_req
-#undef test_carry_req
-
-#undef USE_NEXT_LOAD
-#undef USE_UNALIGNED_LOADS
-#undef UNROLL_COUNT
-#undef UNROLL_SIZE
+//#undef NAME
+//#undef ASCII_SUFFIX
+//#undef SUFFIX
+//#undef V_LEN
+//
+//#undef vec_t
+//#undef vmask_t
+//#undef vmask2_t
+//
+//#undef v_load
+//#undef v_loadu
+//#undef v_set1
+//#undef v_and
+//#undef v_andn
+//#undef v_or
+//#undef v_xor
+//#undef v_add
+//#undef v_shl
+//#undef v_shr
+//#undef v_test_any
+//#undef v_test_bit
+//#undef v_lookup
+//#undef V_TABLE_16
+//#undef V_TABLE_64
+//
+//#undef vmask_zero
+//#undef mask_carry_req
+//#undef test_carry_req
+//#undef result_fails
+//
+//#undef USE_NEXT_LOAD
+//#undef USE_UNALIGNED_LOADS
+//#undef USE_VECTOR_CONT_CHECK
+//#undef UNROLL_COUNT
+//#undef UNROLL_SIZE
