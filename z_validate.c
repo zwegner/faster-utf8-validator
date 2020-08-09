@@ -1078,40 +1078,46 @@ int NAME(z_validate_utf8)(const char *data, size_t len) {
     return !test_carry_req(state);
 }
 
-// Undefine all macros
+// Undefine all macros, unless NO_UNDEF is defined. This is a hacky way to
+// make integration of this library a bit easier for some uses, where the
+// user wants to use something like the NAME macro or the vector/mask types.
 
-//#undef NAME
-//#undef ASCII_SUFFIX
-//#undef SUFFIX
-//#undef V_LEN
-//
-//#undef vec_t
-//#undef vmask_t
-//#undef vmask2_t
-//
-//#undef v_load
-//#undef v_loadu
-//#undef v_set1
-//#undef v_and
-//#undef v_andn
-//#undef v_or
-//#undef v_xor
-//#undef v_add
-//#undef v_shl
-//#undef v_shr
-//#undef v_test_any
-//#undef v_test_bit
-//#undef v_lookup
-//#undef V_TABLE_16
-//#undef V_TABLE_64
-//
-//#undef vmask_zero
-//#undef mask_carry_req
-//#undef test_carry_req
-//#undef result_fails
-//
-//#undef USE_NEXT_LOAD
-//#undef USE_UNALIGNED_LOADS
-//#undef USE_VECTOR_CONT_CHECK
-//#undef UNROLL_COUNT
-//#undef UNROLL_SIZE
+#if !defined(NO_UNDEF)
+
+#undef NAME
+#undef ASCII_SUFFIX
+#undef SUFFIX
+#undef V_LEN
+
+#undef vec_t
+#undef vmask_t
+#undef vmask2_t
+
+#undef v_load
+#undef v_loadu
+#undef v_set1
+#undef v_and
+#undef v_andn
+#undef v_or
+#undef v_xor
+#undef v_add
+#undef v_shl
+#undef v_shr
+#undef v_test_any
+#undef v_test_bit
+#undef v_lookup
+#undef V_TABLE_16
+#undef V_TABLE_64
+
+#undef vmask_zero
+#undef mask_carry_req
+#undef test_carry_req
+#undef result_fails
+
+#undef USE_NEXT_LOAD
+#undef USE_UNALIGNED_LOADS
+#undef USE_VECTOR_CONT_CHECK
+#undef UNROLL_COUNT
+#undef UNROLL_SIZE
+
+#endif
